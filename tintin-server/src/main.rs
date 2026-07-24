@@ -14,20 +14,20 @@
 //! - `{"cmd":"send","envelope":{...}}`
 //! - `{"cmd":"receive","user_id":"alice"}`
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
-use tintin_core::{Envelope, MessageType, ReceiptContent, ReceiptType};
+use tintin_core::{Envelope, MessageType};
 
-type KeyStore = Arc<Mutex<HashMap<String, serde_json::Value>>>;
-type MessageQueue = Arc<Mutex<HashMap<String, Vec<Envelope>>>>;
+mod store;
+use store::Store;
 
 struct AppState {
-    keys: KeyStore,
-    queues: MessageQueue,
+    store: Store,
 }
+
+/// Default database path (relative to cwd).
+const DB_PATH: &str = "tintin-server.db";
 
 #[tokio::main]
 async fn main() {
@@ -36,10 +36,9 @@ async fn main() {
         .await
         .expect("Failed to bind to address");
 
-    let state = Arc::new(AppState {
-        keys: Arc::new(Mutex::new(HashMap::new())),
-        queues: Arc::new(Mutex::new(HashMap::new())),
-    });
+    let store = Store::open(DB_PATH).expect("Failed to open database");
+
+    let state = Arc::new(AppState { store });
 
     eprintln!("🚀 TinTin Relay Server listening on {addr}");
 
@@ -175,20 +174,26 @@ async fn handle_register(value: &serde_json::Value, state: &AppState) -> ServerR
         }
     };
 
-    let bundle = serde_json::json!({
-        "identity_key": cmd.identity_key,
-        "signed_pre_key": cmd.signed_pre_key,
-    });
+    let signed_pre_key_json =
+        serde_json::to_string(&cmd.signed_pre_key).unwrap_or_default();
 
-    let mut keys = state.keys.lock().await;
-    keys.insert(cmd.user_id.clone(), bundle);
-
-    eprintln!("  ✓ Registered user '{}'", cmd.user_id);
-
-    ServerResponse {
-        status: "ok".to_string(),
-        data: Some(serde_json::json!({"user_id": cmd.user_id})),
-        error: None,
+    match state
+        .store
+        .register_user(&cmd.user_id, &cmd.identity_key, &signed_pre_key_json)
+    {
+        Ok(()) => {
+            eprintln!("  ✓ Registered user '{}'", cmd.user_id);
+            ServerResponse {
+                status: "ok".to_string(),
+                data: Some(serde_json::json!({"user_id": cmd.user_id})),
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Database error: {e}")),
+        },
     }
 }
 
@@ -204,20 +209,24 @@ async fn handle_fetch_keys(value: &serde_json::Value, state: &AppState) -> Serve
         }
     };
 
-    let keys = state.keys.lock().await;
-    match keys.get(&cmd.user_id) {
-        Some(bundle) => {
+    match state.store.get_key_bundle(&cmd.user_id) {
+        Ok(Some(bundle)) => {
             eprintln!("  → Sent key bundle for '{}'", cmd.user_id);
             ServerResponse {
                 status: "ok".to_string(),
-                data: Some(bundle.clone()),
+                data: Some(bundle),
                 error: None,
             }
         }
-        None => ServerResponse {
+        Ok(None) => ServerResponse {
             status: "error".to_string(),
             data: None,
             error: Some(format!("User '{}' not found", cmd.user_id)),
+        },
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Database error: {e}")),
         },
     }
 }
@@ -235,18 +244,21 @@ async fn handle_send(value: &serde_json::Value, state: &AppState) -> ServerRespo
     };
 
     let recipient = cmd.envelope.recipient_id.clone();
-    let mut queues = state.queues.lock().await;
-    queues
-        .entry(recipient.clone())
-        .or_default()
-        .push(cmd.envelope);
 
-    eprintln!("  📨 Queued message for '{}'", recipient);
-
-    ServerResponse {
-        status: "ok".to_string(),
-        data: Some(serde_json::json!({"queued_for": recipient})),
-        error: None,
+    match state.store.queue_message(&cmd.envelope) {
+        Ok(()) => {
+            eprintln!("  📨 Queued message for '{}'", recipient);
+            ServerResponse {
+                status: "ok".to_string(),
+                data: Some(serde_json::json!({"queued_for": recipient})),
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Database error: {e}")),
+        },
     }
 }
 
@@ -262,55 +274,47 @@ async fn handle_receive(value: &serde_json::Value, state: &AppState) -> ServerRe
         }
     };
 
-    let mut queues = state.queues.lock().await;
-    let messages = queues.remove(&cmd.user_id).unwrap_or_default();
-
-    // Auto-queue delivery receipts for Normal / PreKeyBundle messages.
-    for msg in &messages {
-        if msg.msg_type == MessageType::Normal || msg.msg_type == MessageType::PreKeyBundle {
-            let receipt = ReceiptContent {
-                receipt_type: ReceiptType::Delivery,
-                original_sender: msg.sender_id.clone(),
-                original_timestamp: msg.timestamp,
-            };
-            let receipt_bytes = serde_json::to_vec(&receipt).unwrap_or_default();
-            let receipt_env = Envelope::new(
-                cmd.user_id.clone(),    // "sender" of the receipt
-                msg.sender_id.clone(),  // original sender gets the receipt
-                receipt_bytes,
-                MessageType::Receipt,
-            );
-            queues
-                .entry(msg.sender_id.clone())
-                .or_default()
-                .push(receipt_env);
-            eprintln!("  📬 Delivery receipt queued for '{}'", msg.sender_id);
+    match state.store.fetch_messages(&cmd.user_id) {
+        Ok(messages) => {
+            eprintln!("  → {} messages for '{}'", messages.len(), cmd.user_id);
+            ServerResponse {
+                status: "ok".to_string(),
+                data: Some(serde_json::json!({"messages": messages})),
+                error: None,
+            }
         }
-    }
-
-    eprintln!("  → {} messages for '{}'", messages.len(), cmd.user_id);
-
-    ServerResponse {
-        status: "ok".to_string(),
-        data: Some(serde_json::json!({"messages": messages})),
-        error: None,
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Database error: {e}")),
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tintin_core::{Envelope, MessageType};
+use tintin_core::Envelope;
+
+    /// Helper: create an AppState backed by a temporary in-memory database.
+    fn test_state() -> Arc<AppState> {
+        let path = std::env::temp_dir().join(format!(
+            "tintin-test-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path_str = path.to_str().unwrap();
+        let store = Store::open(path_str).expect("Failed to create test store");
+        Arc::new(AppState { store })
+    }
 
     #[tokio::test]
     async fn test_register_and_fetch() {
-        let state = Arc::new(AppState {
-            keys: Arc::new(Mutex::new(HashMap::new())),
-            queues: Arc::new(Mutex::new(HashMap::new())),
-        });
+        let state = test_state();
 
-        // Register alice — build programmatically because json! macro
-        // can't handle byte array expressions like [0u8; 32].
+        // Register alice
         let identity_key: Vec<u8> = vec![0u8; 32];
         let spk_pub: Vec<u8> = vec![1u8; 32];
         let spk_sig: Vec<u8> = vec![2u8; 64];
@@ -345,10 +349,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_send_receive() {
-        let state = Arc::new(AppState {
-            keys: Arc::new(Mutex::new(HashMap::new())),
-            queues: Arc::new(Mutex::new(HashMap::new())),
-        });
+        let state = test_state();
 
         let envelope = Envelope::new(
             "alice".to_string(),
@@ -373,5 +374,88 @@ mod tests {
         let data = resp.data.unwrap();
         let msgs = data["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_persistence_across_reconnect() {
+        // Simulate server restart by creating two sequential store instances
+        // pointing at the same file.
+        let path = std::env::temp_dir().join(format!(
+            "tintin-persist-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = path.to_str().unwrap().to_string();
+
+        // First "session" — register and send.
+        {
+            let store = Store::open(&path).expect("open #1");
+            let state = Arc::new(AppState { store });
+
+            let identity_key: Vec<u8> = vec![0u8; 32];
+            let spk_pub: Vec<u8> = vec![1u8; 32];
+            let spk_sig: Vec<u8> = vec![2u8; 64];
+
+            let register = serde_json::json!({
+                "cmd": "register",
+                "user_id": "alice",
+                "identity_key": identity_key,
+                "signed_pre_key": {
+                    "identity_key": identity_key,
+                    "device_id": 1,
+                    "signed_pre_key_id": 1,
+                    "signed_pre_key": spk_pub,
+                    "signed_pre_key_signature": spk_sig,
+                    "one_time_pre_key_id": null,
+                    "one_time_pre_key": null
+                }
+            });
+            let resp = handle_command(&register.to_string(), &state).await;
+            assert_eq!(resp.status, "ok", "register should work");
+
+            let env = Envelope::new(
+                "alice".to_string(),
+                "bob".to_string(),
+                vec![10, 20, 30],
+                MessageType::Normal,
+            );
+            let send = serde_json::json!({"cmd": "send", "envelope": env});
+            let resp = handle_command(&send.to_string(), &state).await;
+            assert_eq!(resp.status, "ok", "send should work");
+        }
+        // store dropped — "server restarted"
+
+        // Second "session" — verify data survived.
+        {
+            let store = Store::open(&path).expect("open #2");
+            let state = Arc::new(AppState { store });
+
+            // Fetch alice keys should still work.
+            let fetch = serde_json::json!({"cmd": "fetch_keys", "user_id": "alice"});
+            let resp = handle_command(&fetch.to_string(), &state).await;
+            assert_eq!(resp.status, "ok", "fetch should work after restart");
+            assert!(resp.data.is_some(), "key bundle should persist");
+
+            // Bob should still have the queued message.
+            let recv = serde_json::json!({"cmd": "receive", "user_id": "bob"});
+            let resp = handle_command(&recv.to_string(), &state).await;
+            assert_eq!(resp.status, "ok", "receive should work after restart");
+            let data = resp.data.unwrap();
+            let msgs = data["messages"].as_array().unwrap();
+            assert_eq!(msgs.len(), 1, "message should survive restart");
+            assert_eq!(
+                msgs[0]["sender_id"].as_str().unwrap(),
+                "alice",
+                "sender should match"
+            );
+        }
+
+        // Cleanup
+        let _ = std::fs::remove_file(&path);
+        // Also clean up WAL / SHM files that SQLite may have created.
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
     }
 }

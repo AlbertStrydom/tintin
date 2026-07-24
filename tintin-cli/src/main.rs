@@ -5,6 +5,7 @@
 //! receiving end-to-end encrypted messages.
 
 use std::io::{self, Write};
+use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -15,7 +16,7 @@ use tintin_core::{
 };
 
 /// Status of a sent message for ✓/✓✓ tracking.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum MessageStatus {
     Sent,
     Delivered,
@@ -23,7 +24,7 @@ enum MessageStatus {
 }
 
 /// A sent message with its delivery status.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SentMessage {
     recipient: String,
     text: String,
@@ -55,7 +56,7 @@ impl TinTinClient {
         let identity = IdentityKeyPair::generate();
         let signed_pre_key = SignedPreKey::generate(1, &identity);
 
-        Self {
+        let mut client = Self {
             user_id: user_id.to_string(),
             identity,
             signed_pre_key,
@@ -63,6 +64,49 @@ impl TinTinClient {
             writer: None,
             reader: None,
             sent_messages: Vec::new(),
+        };
+        client.load_history();
+        client
+    }
+
+    /// Path to the history file for this user.
+    fn history_path(&self) -> PathBuf {
+        // Use USERPROFILE (Windows) or HOME (Unix) to find ~/.tintin/<user_id>.json
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_else(|_| ".".to_string());
+        let dir = PathBuf::from(home).join(".tintin");
+        // Ensure directory exists.
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(format!("{}.json", self.user_id))
+    }
+
+    /// Load sent message history from disk.
+    fn load_history(&mut self) {
+        let path = self.history_path();
+        if !path.exists() {
+            return;
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(json) => {
+                if let Ok(msgs) = serde_json::from_str::<Vec<SentMessage>>(&json) {
+                    self.sent_messages = msgs;
+                }
+            }
+            Err(e) => eprintln!("⚠️ Could not load message history: {e}"),
+        }
+    }
+
+    /// Save sent message history to disk.
+    fn save_history(&self) {
+        let path = self.history_path();
+        match serde_json::to_string_pretty(&self.sent_messages) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, &json) {
+                    eprintln!("⚠️ Could not save message history: {e}");
+                }
+            }
+            Err(e) => eprintln!("⚠️ Could not serialize message history: {e}"),
         }
     }
 
@@ -206,6 +250,7 @@ impl TinTinClient {
             timestamp: envelope.timestamp,
             status: MessageStatus::Sent,
         });
+        self.save_history();
         println!("✓ Sent to '{}' (✓)", recipient);
         Ok(())
     }
@@ -323,28 +368,38 @@ impl TinTinClient {
                         Ok(receipt) => match receipt.receipt_type {
                             ReceiptType::Delivery => {
                                 // Update our sent message to Delivered.
-                                let found = self.sent_messages.iter_mut().find(|m| {
+                                let mut found_text = String::new();
+                                let updated = self.sent_messages.iter_mut().find(|m| {
                                     m.recipient == envelope.sender_id
                                         && m.timestamp == receipt.original_timestamp
                                 });
-                                if let Some(msg) = found {
+                                if let Some(msg) = updated {
                                     msg.status = MessageStatus::Delivered;
+                                    found_text = msg.text.clone();
+                                }
+                                if !found_text.is_empty() {
+                                    self.save_history();
                                     println!(
                                         "✓✓ '{}' delivered — \"{}\"",
-                                        envelope.sender_id, msg.text
+                                        envelope.sender_id, found_text
                                     );
                                 }
                             }
                             ReceiptType::Read => {
-                                let found = self.sent_messages.iter_mut().find(|m| {
+                                let mut found_text = String::new();
+                                let updated = self.sent_messages.iter_mut().find(|m| {
                                     m.recipient == envelope.sender_id
                                         && m.timestamp == receipt.original_timestamp
                                 });
-                                if let Some(msg) = found {
+                                if let Some(msg) = updated {
                                     msg.status = MessageStatus::Read;
+                                    found_text = msg.text.clone();
+                                }
+                                if !found_text.is_empty() {
+                                    self.save_history();
                                     println!(
                                         "✓✓ '{}' read — \"{}\"",
-                                        envelope.sender_id, msg.text
+                                        envelope.sender_id, found_text
                                     );
                                 }
                             }
