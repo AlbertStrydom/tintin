@@ -51,6 +51,21 @@ pub enum MessageType {
     Typing,
 }
 
+/// A receipt (delivery or read confirmation).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReceiptContent {
+    pub receipt_type: ReceiptType,
+    pub original_sender: String,
+    pub original_timestamp: u64,
+}
+
+/// Kind of receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReceiptType {
+    Delivery,
+    Read,
+}
+
 /// A plaintext chat message (before encryption).
 /// This is what the user actually types.
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -43,6 +43,13 @@ struct EnvelopeValue: Codable {
 
 // MARK: - Relay Service
 
+/// A receipt content payload received from the server.
+struct ReceiptContentValue: Codable {
+    let receipt_type: String
+    let original_sender: String
+    let original_timestamp: UInt64
+}
+
 /// TCP client for the TinTin relay server.
 /// Uses NWConnection (Network.framework) for async I/O.
 actor RelayService {

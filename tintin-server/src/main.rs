@@ -19,7 +19,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use tintin_core::Envelope;
+use tintin_core::{Envelope, MessageType, ReceiptContent, ReceiptType};
 
 type KeyStore = Arc<Mutex<HashMap<String, serde_json::Value>>>;
 type MessageQueue = Arc<Mutex<HashMap<String, Vec<Envelope>>>>;
@@ -264,6 +264,29 @@ async fn handle_receive(value: &serde_json::Value, state: &AppState) -> ServerRe
 
     let mut queues = state.queues.lock().await;
     let messages = queues.remove(&cmd.user_id).unwrap_or_default();
+
+    // Auto-queue delivery receipts for Normal / PreKeyBundle messages.
+    for msg in &messages {
+        if msg.msg_type == MessageType::Normal || msg.msg_type == MessageType::PreKeyBundle {
+            let receipt = ReceiptContent {
+                receipt_type: ReceiptType::Delivery,
+                original_sender: msg.sender_id.clone(),
+                original_timestamp: msg.timestamp,
+            };
+            let receipt_bytes = serde_json::to_vec(&receipt).unwrap_or_default();
+            let receipt_env = Envelope::new(
+                cmd.user_id.clone(),    // "sender" of the receipt
+                msg.sender_id.clone(),  // original sender gets the receipt
+                receipt_bytes,
+                MessageType::Receipt,
+            );
+            queues
+                .entry(msg.sender_id.clone())
+                .or_default()
+                .push(receipt_env);
+            eprintln!("  📬 Delivery receipt queued for '{}'", msg.sender_id);
+        }
+    }
 
     eprintln!("  → {} messages for '{}'", messages.len(), cmd.user_id);
 

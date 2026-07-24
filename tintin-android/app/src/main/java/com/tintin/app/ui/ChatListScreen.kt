@@ -150,6 +150,19 @@ private suspend fun startChat(appState: AppState, remoteId: String) {
 
 private fun handleIncoming(appState: AppState, env: EnvelopeResponse) {
     val remoteId = env.senderId
+
+    // Skip receipts — they're not encrypted.
+    if (env.msgType == "Receipt") {
+        try {
+            val json = String(env.content)
+            val obj = com.google.gson.JsonParser.parseString(json).asJsonObject
+            val type = obj.get("receipt_type")?.asString ?: return
+            val sender = obj.get("original_sender")?.asString ?: return
+            android.util.Log.d("TinTin", "Receipt: $type from $sender")
+        } catch (_: Exception) {}
+        return
+    }
+
     try {
         val pt = appState.sessionManager.decryptMessage(remoteId, env.content)
         if (pt != null) {

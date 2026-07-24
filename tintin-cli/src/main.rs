@@ -10,9 +10,26 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use tintin_core::{
-    Envelope, IdentityKeyPair, KeyPair, MessageType, PreKeyBundleMessage, Session,
-    SessionMessage, SessionStore, SignedPreKey, TinTinError,
+    Envelope, IdentityKeyPair, KeyPair, MessageType, PreKeyBundleMessage, ReceiptContent,
+    ReceiptType, Session, SessionMessage, SessionStore, SignedPreKey,
 };
+
+/// Status of a sent message for ✓/✓✓ tracking.
+#[derive(Debug, Clone)]
+enum MessageStatus {
+    Sent,
+    Delivered,
+    Read,
+}
+
+/// A sent message with its delivery status.
+#[derive(Debug, Clone)]
+struct SentMessage {
+    recipient: String,
+    text: String,
+    timestamp: u64,
+    status: MessageStatus,
+}
 
 /// A connected TinTin client instance.
 struct TinTinClient {
@@ -28,6 +45,8 @@ struct TinTinClient {
     writer: Option<Mutex<tokio::net::tcp::OwnedWriteHalf>>,
     /// Reader half of the TCP stream.
     reader: Option<Mutex<tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>>>,
+    /// Track sent messages for ✓/✓✓ status.
+    sent_messages: Vec<SentMessage>,
 }
 
 impl TinTinClient {
@@ -43,6 +62,7 @@ impl TinTinClient {
             sessions: SessionStore::new(),
             writer: None,
             reader: None,
+            sent_messages: Vec::new(),
         }
     }
 
@@ -179,7 +199,14 @@ impl TinTinClient {
             return Err(format!("Send failed: {}", resp["error"]).into());
         }
 
-        println!("✓ Sent E2E encrypted message to '{}'", recipient);
+        // Track this sent message for ✓/✓✓ status.
+        self.sent_messages.push(SentMessage {
+            recipient: recipient.to_string(),
+            text: plaintext.to_string(),
+            timestamp: envelope.timestamp,
+            status: MessageStatus::Sent,
+        });
+        println!("✓ Sent to '{}' (✓)", recipient);
         Ok(())
     }
 
@@ -212,10 +239,8 @@ impl TinTinClient {
         for msg_value in &messages {
             let envelope: Envelope = serde_json::from_value(msg_value.clone())?;
 
-            let result = match envelope.msg_type {
+            match envelope.msg_type {
                 MessageType::PreKeyBundle => {
-                    // First message from this sender — parse the bundle and
-                    // create a responder session.
                     let prekey: PreKeyBundleMessage =
                         serde_json::from_slice(&envelope.content)?;
 
@@ -233,28 +258,104 @@ impl TinTinClient {
                         self.signed_pre_key.clone(),
                     )?;
 
-                    let plaintext = new_session.decrypt(&prekey.session_message)?;
-                    self.sessions.add(new_session);
-                    Ok(plaintext)
-                }
-                MessageType::Normal => {
-                    let session_msg = SessionMessage::from_json(&envelope.content)?;
-                    if let Some(session) = self.sessions.get_mut(&envelope.sender_id, 1) {
-                        session.decrypt(&session_msg)
-                    } else {
-                        Err(TinTinError::SessionNotFound)
+                    match new_session.decrypt(&prekey.session_message) {
+                        Ok(plaintext) => {
+                            self.sessions.add(new_session);
+                            let text = String::from_utf8_lossy(&plaintext);
+                            println!("💬 {}: {}", envelope.sender_id, text);
+                            // Send a read receipt back to the sender.
+                            self.send_receipt(
+                                &envelope.sender_id,
+                                &envelope.sender_id,
+                                envelope.timestamp,
+                                ReceiptType::Read,
+                            )
+                            .await
+                            .ok();
+                        }
+                        Err(e) => {
+                            println!(
+                                "⚠️ Could not decrypt message from {}: {}",
+                                envelope.sender_id, e
+                            );
+                        }
                     }
                 }
-                _ => Err(TinTinError::SessionNotFound),
-            };
-
-            match result {
-                Ok(plaintext) => {
-                    let text = String::from_utf8_lossy(&plaintext);
-                    println!("💬 {}: {}", envelope.sender_id, text);
+                MessageType::Normal => {
+                    let session_msg = match SessionMessage::from_json(&envelope.content) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            println!("⚠️ Invalid message from {}: {}", envelope.sender_id, e);
+                            continue;
+                        }
+                    };
+                    if let Some(session) = self.sessions.get_mut(&envelope.sender_id, 1) {
+                        match session.decrypt(&session_msg) {
+                            Ok(plaintext) => {
+                                let text = String::from_utf8_lossy(&plaintext);
+                                println!("💬 {}: {}", envelope.sender_id, text);
+                                // Send a read receipt back to the sender.
+                                self.send_receipt(
+                                    &envelope.sender_id,
+                                    &envelope.sender_id,
+                                    envelope.timestamp,
+                                    ReceiptType::Read,
+                                )
+                                .await
+                                .ok();
+                            }
+                            Err(e) => {
+                                println!(
+                                    "⚠️ Could not decrypt message from {}: {}",
+                                    envelope.sender_id, e
+                                );
+                            }
+                        }
+                    } else {
+                        println!(
+                            "⚠️ No session with {}. They need to message you first.",
+                            envelope.sender_id
+                        );
+                    }
                 }
-                Err(e) => {
-                    println!("⚠️ Could not decrypt message from {}: {}", envelope.sender_id, e);
+                MessageType::Receipt => {
+                    match serde_json::from_slice::<ReceiptContent>(&envelope.content) {
+                        Ok(receipt) => match receipt.receipt_type {
+                            ReceiptType::Delivery => {
+                                // Update our sent message to Delivered.
+                                let found = self.sent_messages.iter_mut().find(|m| {
+                                    m.recipient == envelope.sender_id
+                                        && m.timestamp == receipt.original_timestamp
+                                });
+                                if let Some(msg) = found {
+                                    msg.status = MessageStatus::Delivered;
+                                    println!(
+                                        "✓✓ '{}' delivered — \"{}\"",
+                                        envelope.sender_id, msg.text
+                                    );
+                                }
+                            }
+                            ReceiptType::Read => {
+                                let found = self.sent_messages.iter_mut().find(|m| {
+                                    m.recipient == envelope.sender_id
+                                        && m.timestamp == receipt.original_timestamp
+                                });
+                                if let Some(msg) = found {
+                                    msg.status = MessageStatus::Read;
+                                    println!(
+                                        "✓✓ '{}' read — \"{}\"",
+                                        envelope.sender_id, msg.text
+                                    );
+                                }
+                            }
+                        },
+                        Err(_) => {
+                            // If we can't parse the receipt, ignore it.
+                        }
+                    }
+                }
+                _ => {
+                    println!("⚠️ Unknown message type from {}", envelope.sender_id);
                 }
             }
         }
@@ -274,6 +375,35 @@ impl TinTinClient {
             writer.write_all(json.as_bytes()).await?;
             writer.flush().await?;
         }
+        Ok(())
+    }
+
+    /// Send a delivery or read receipt to a user.
+    async fn send_receipt(
+        &self,
+        recipient: &str,
+        original_sender: &str,
+        original_timestamp: u64,
+        receipt_type: ReceiptType,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let receipt = ReceiptContent {
+            receipt_type,
+            original_sender: original_sender.to_string(),
+            original_timestamp,
+        };
+        let receipt_bytes = serde_json::to_vec(&receipt)?;
+        let receipt_env = Envelope::new(
+            self.user_id.clone(),
+            recipient.to_string(),
+            receipt_bytes,
+            MessageType::Receipt,
+        );
+        let request = serde_json::json!({
+            "cmd": "send",
+            "envelope": receipt_env,
+        });
+        self.send_json(&request).await?;
+        let _resp = self.recv_json().await?; // ignore response
         Ok(())
     }
 
@@ -317,8 +447,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  /msg username text  — Send an E2E encrypted message");
     println!("         Example: /msg bob Hello Bob!");
     println!("  /recv               — Check for new messages");
+    println!("  /status             — Show sent message status (✓/✓✓)");
     println!("  /help               — Show this help");
     println!("  /quit               — Exit");
+    println!();
+    println!("Status indicators:");
+    println!("  ✓   — Sent (stored on server)");
+    println!("  ✓✓  — Delivered (recipient's server received it)");
     println!();
 
     loop {
@@ -342,6 +477,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  /msg username text  — Send an E2E encrypted message");
             println!("         Example: /msg bob Hello Bob!");
             println!("  /recv               — Poll for new messages");
+            println!("  /status             — Show sent message status (✓/✓✓)");
             println!("  /help               — Show this help");
             println!("  /quit               — Exit");
             continue;
@@ -350,6 +486,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if input == "/recv" {
             if let Err(e) = client.receive_messages().await {
                 eprintln!("Error: {e}");
+            }
+            continue;
+        }
+
+        if input == "/status" {
+            let sent = &client.sent_messages;
+            if sent.is_empty() {
+                println!("No sent messages yet.");
+            } else {
+                for msg in sent {
+                    let status = match msg.status {
+                        MessageStatus::Sent => "✓",
+                        MessageStatus::Delivered => "✓✓",
+                        MessageStatus::Read => "✓✓",
+                    };
+                    println!("  {status} {} → {} ({})", msg.text, msg.recipient, status);
+                }
             }
             continue;
         }

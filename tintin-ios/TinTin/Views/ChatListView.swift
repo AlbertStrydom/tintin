@@ -161,9 +161,18 @@ struct ChatListView: View {
         do {
             let envelopes = try await appState.relay.receive(userId: appState.userId)
             for env in envelopes {
-                // Find or create contact
                 let senderId = env.sender_id
                 let contentData = Data(env.content)
+
+                // Skip receipts — they're not encrypted.
+                if env.msg_type == "Receipt" {
+                    if let receipt = try? JSONDecoder().decode(
+                        ReceiptContentValue.self, from: contentData
+                    ) {
+                        print("Receipt: \(receipt.receipt_type) from \(senderId)")
+                    }
+                    continue
+                }
 
                 // Load the session for this sender (as responder)
                 if let sessionJSON = appState.sessions[senderId] {

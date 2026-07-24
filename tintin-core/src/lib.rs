@@ -31,7 +31,10 @@ pub use keys::{
     IdentityKeyPair, KeyPair, OneTimePreKey, OneTimePreKeyPublic, SignedPreKey,
     SignedPreKeyPublic,
 };
-pub use message::{ChatMessage, Envelope, MessageType, PreKeyBundleMessage, SessionMessage};
+pub use message::{
+    ChatMessage, Envelope, MessageType, PreKeyBundleMessage, ReceiptContent, ReceiptType,
+    SessionMessage,
+};
 pub use ratchet::{Ratchet, RatchetedMessage};
 pub use session::{Session, SessionRole, SessionStore};
 
