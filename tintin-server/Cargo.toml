@@ -1,0 +1,15 @@
+[package]
+name = "tintin-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+tintin-core = { path = "../tintin-core" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+hex.workspace = true
+log.workspace = true
+env_logger.workspace = true

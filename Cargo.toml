@@ -1,0 +1,23 @@
+[workspace]
+resolver = "3"
+members = [
+    "tintin-core",
+    "tintin-cli",
+    "tintin-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+authors = ["A.Strydom"]
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+thiserror = "2"
+rand = "0.8"
+hex = "0.4"
+log = "0.4"
+env_logger = "0.11"
