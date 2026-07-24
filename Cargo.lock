@@ -756,6 +756,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tintin-ffi"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tintin-core",
+]
+
+[[package]]
 name = "tintin-server"
 version = "0.1.0"
 dependencies = [

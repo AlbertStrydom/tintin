@@ -6,15 +6,17 @@ A secure, open-source messaging app that combines the best of WhatsApp, Telegram
 
 ## Phase 1 — Rust Foundations ✓
 
-This is the first phase of the TinTin project: a **Rust-based CLI chat client with E2E encryption**.
+The core Rust library, relay server, and CLI chat client with E2E encryption.
 
 ### Architecture
 
 ```
 tintin/
 ├── tintin-core/      # Shared Rust library: crypto, keys, Double Ratchet
+├── tintin-ffi/       # C-compatible FFI layer for iOS/Android clients
 ├── tintin-server/    # Minimal relay server (store-and-forward)
 ├── tintin-cli/       # Terminal chat client
+├── tintin-ios/       # iOS SwiftUI app (Phase 2)
 └── Cargo.toml        # Workspace definition
 ```
 
@@ -28,7 +30,9 @@ tintin/
 | **Session Management** | ✅ Session creation, in-memory store |
 | **Relay Server** | ✅ TCP with JSON protocol, key store, message queue |
 | **CLI Client** | ✅ Register, send, receive encrypted messages |
-| **Tests** | ✅ 15 passing (core crypto + server relay) |
+| **C FFI Layer** | ✅ Identity, signed pre-key, session encrypt/decrypt via C |
+| **iOS SwiftUI App** | ✅ All source files + XcodeGen project spec |
+| **Tests** | ✅ 17 passing (core crypto + server relay + FFI) |
 
 ## How to Run
 
@@ -122,9 +126,72 @@ cd tintin
 cargo test --workspace
 ```
 
+## Phase 2 — iOS App (SwiftUI + Rust FFI) 🏗️
+
+The `tintin-ios/` directory contains a complete SwiftUI client that calls into Rust through a C FFI bridge.
+
+### How to Build on Mac
+
+You need a Mac with Xcode 15+, Rust, and the iOS Rust targets installed:
+
+```bash
+# 1. Install dependencies
+brew install xcodegen
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+
+# 2. Build the Rust library for all iOS targets
+cd tintin-ios
+./build_rust.sh
+
+# 3. Generate the Xcode project
+xcodegen generate
+
+# 4. Open TinTin.xcodeproj, set your team in Signing & Capabilities, and run
+```
+
+### iOS App Architecture
+
+```
+tintin-ios/
+├── project.yml              # XcodeGen project spec
+├── build_rust.sh            # Cross-compiles Rust for iOS
+├── TinTin/
+│   ├── TinTinApp.swift       # @main entry — navigation flow
+│   ├── Info.plist
+│   ├── Models/               # Swift data types
+│   │   ├── ServerConfig.swift
+│   │   ├── UserModel.swift
+│   │   └── MessageModel.swift
+│   ├── Services/             # Business logic
+│   │   ├── RustCoreService.swift   # Safe Swift wrapper around C FFI
+│   │   └── RelayService.swift      # TCP relay client (NWConnection)
+│   ├── Views/                # SwiftUI screens
+│   │   ├── ConnectView.swift
+│   │   ├── RegisterView.swift
+│   │   ├── ChatListView.swift
+│   │   └── ChatView.swift
+│   └── Bridge/               # C bridging header + Rust lib
+│       ├── tintin_core.h
+│       └── TinTin-Bridging-Header.h
+```
+
+### App Flow
+
+1. **Connect** — enter server host/port and your user ID
+2. **Register** — generates identity keys, uploads public key bundle to relay
+3. **Chat List** — shows contacts; tap "+" to start a new encrypted conversation (fetches remote keys, creates Double Ratchet session)
+4. **Chat** — messages are encrypted in Rust, sent as JSON via TCP, decrypted on the receiving side
+
+### Current Limitations (Phase 2)
+
+- Polling-based message receive (3s interval) — push notifications come later
+- Pre-key bundle messages not fully implemented on the responder side
+- No message persistence (sessions stored in UserDefaults)
+- Single device (device_id always 1)
+
 ## Roadmap
 
-- **Phase 2**: iOS app (SwiftUI) with Rust core via FFI
+- **Phase 2**: ✅ iOS SwiftUI app (source complete, needs Mac build) 🏗️
 - **Phase 3**: Android app (Jetpack Compose) with same Rust core
 - **Phase 4**: Group chats, voice messages, calls
 - **Phase 5**: Channels, stickers, mini-apps

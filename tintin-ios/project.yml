@@ -1,0 +1,75 @@
+name: TinTin
+options:
+  bundleIdPrefix: com.tintin
+  deploymentTarget:
+    iOS: "17.0"
+  xcodeVersion: "15.0"
+
+settings:
+  base:
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: 1
+    DEVELOPMENT_TEAM: ""   # Fill with your Apple Developer Team ID
+
+targets:
+  TinTin:
+    type: application
+    platform: iOS
+    sources:
+      - path: TinTin
+        type: group
+        createsGroup: true
+        children:
+          # XcodeGen auto-recognises .swift files; we list them for clarity
+          - path: TinTinApp.swift
+          - path: Models
+            children:
+              - path: ServerConfig.swift
+              - path: UserModel.swift
+              - path: MessageModel.swift
+          - path: Services
+            children:
+              - path: RustCoreService.swift
+              - path: RelayService.swift
+          - path: Views
+            children:
+              - path: ConnectView.swift
+              - path: RegisterView.swift
+              - path: ChatListView.swift
+              - path: ChatView.swift
+          - path: Bridge
+            children:
+              - path: tintin_core.h
+              - path: TinTin-Bridging-Header.h
+          - path: Info.plist
+
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.tintin.app
+        INFOPLIST_FILE: TinTin/Info.plist
+        SWIFT_VERSION: "5.9"
+        ENABLE_USER_SCRIPT_SANDBOXING: "NO"  # Required to run build-phase script
+
+        # Swift bridging header for the C FFI
+        SWIFT_OBJC_BRIDGING_HEADER: "TinTin/Bridge/TinTin-Bridging-Header.h"
+
+        # Library search paths — Rust static library lives here
+        LIBRARY_SEARCH_PATHS:
+          - "$(SRCROOT)/lib"
+
+        # Link our Rust static library and system frameworks
+        OTHER_LINKER_FLAGS:
+          - "-ltintin_core"
+          - "-lresolv"
+          - "-framework"
+          - "Foundation"
+
+    # Build phase: run a script that (re)builds the Rust library when sources change.
+    # Comment this out if you prefer to build manually with build_rust.sh.
+    preBuildScripts:
+      - name: "Build Rust library for iOS"
+        script: |
+          if [ -f "${SRCROOT}/build_rust.sh" ]; then
+            "${SRCROOT}/build_rust.sh"
+          fi
+        basedOnDependencyAnalysis: false

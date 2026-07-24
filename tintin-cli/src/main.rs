@@ -10,8 +10,8 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use tintin_core::{
-    Envelope, IdentityKeyPair, KeyPair, MessageType, Session, SessionMessage,
-    SessionStore, SignedPreKey, TinTinError,
+    Envelope, IdentityKeyPair, KeyPair, MessageType, PreKeyBundleMessage, Session,
+    SessionMessage, SessionStore, SignedPreKey, TinTinError,
 };
 
 /// A connected TinTin client instance.
@@ -105,7 +105,7 @@ impl TinTinClient {
         }
 
         let bundle: tintin_core::message::PreKeyBundle =
-            serde_json::from_value(resp["data"].clone())?;
+            serde_json::from_value(resp["data"]["signed_pre_key"].clone())?;
 
         Ok(bundle)
     }
@@ -116,10 +116,14 @@ impl TinTinClient {
         recipient: &str,
         plaintext: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        // Track whether this is the first message (new session).
+        let mut is_new = false;
+
         // Get or create a session with this user.
         let session = if let Some(s) = self.sessions.get_mut(recipient, 1) {
             s
         } else {
+            is_new = true;
             // Fetch their pre-key bundle and establish a session.
             let bundle = self.fetch_bundle(recipient).await?;
             let new_session = Session::new_initiator(
@@ -142,12 +146,25 @@ impl TinTinClient {
         // Encrypt the message using the session's Double Ratchet.
         let encrypted = session.encrypt(plaintext.as_bytes())?;
 
+        // For the first message, wrap in a PreKeyBundle so the recipient
+        // can create a responder session.
+        let (content, msg_type) = if is_new {
+            let prekey = PreKeyBundleMessage {
+                identity_key: *self.identity.public_key(),
+                base_key: session.ratchet.dh_ratchet_key.public,
+                session_message: encrypted,
+            };
+            (serde_json::to_vec(&prekey)?, MessageType::PreKeyBundle)
+        } else {
+            (encrypted.to_json()?, MessageType::Normal)
+        };
+
         // Wrap in an envelope and send via the relay.
         let envelope = Envelope::new(
             self.user_id.clone(),
             recipient.to_string(),
-            encrypted.to_json()?,
-            MessageType::Normal,
+            content,
+            msg_type,
         );
 
         let request = serde_json::json!({
@@ -194,17 +211,41 @@ impl TinTinClient {
 
         for msg_value in &messages {
             let envelope: Envelope = serde_json::from_value(msg_value.clone())?;
-            let session_msg = SessionMessage::from_json(&envelope.content)?;
 
-            // Get or create the session for this sender.
-            let result = if let Some(session) = self.sessions.get_mut(&envelope.sender_id, 1) {
-                session.decrypt(&session_msg)
-            } else if envelope.msg_type == MessageType::PreKeyBundle {
-                // First message from someone — we need to create a responder session.
-                // For now, skip creation and report need for bundle info.
-                Err(TinTinError::SessionNotFound)
-            } else {
-                Err(TinTinError::SessionNotFound)
+            let result = match envelope.msg_type {
+                MessageType::PreKeyBundle => {
+                    // First message from this sender — parse the bundle and
+                    // create a responder session.
+                    let prekey: PreKeyBundleMessage =
+                        serde_json::from_slice(&envelope.content)?;
+
+                    let mut new_session = Session::new_responder(
+                        IdentityKeyPair {
+                            key_pair: KeyPair {
+                                secret: self.identity.key_pair.secret,
+                                public: self.identity.key_pair.public,
+                            },
+                        },
+                        envelope.sender_id.clone(),
+                        envelope.sender_device_id,
+                        prekey.identity_key,
+                        &prekey.base_key,
+                        self.signed_pre_key.clone(),
+                    )?;
+
+                    let plaintext = new_session.decrypt(&prekey.session_message)?;
+                    self.sessions.add(new_session);
+                    Ok(plaintext)
+                }
+                MessageType::Normal => {
+                    let session_msg = SessionMessage::from_json(&envelope.content)?;
+                    if let Some(session) = self.sessions.get_mut(&envelope.sender_id, 1) {
+                        session.decrypt(&session_msg)
+                    } else {
+                        Err(TinTinError::SessionNotFound)
+                    }
+                }
+                _ => Err(TinTinError::SessionNotFound),
             };
 
             match result {

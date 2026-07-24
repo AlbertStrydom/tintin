@@ -61,10 +61,16 @@ async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
     loop {
         line.clear();
-        let bytes_read = buf_reader
+        let bytes_read = match buf_reader
             .read_line(&mut line)
             .await
-            .expect("Read error");
+        {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("  ⚠ Read error from client: {e}");
+                break;
+            }
+        };
 
         if bytes_read == 0 {
             break; // connection closed
@@ -92,6 +98,7 @@ struct ServerResponse {
 }
 
 #[derive(serde::Deserialize)]
+#[allow(dead_code)]
 struct RegisterCmd {
     cmd: String,
     user_id: String,
@@ -100,18 +107,21 @@ struct RegisterCmd {
 }
 
 #[derive(serde::Deserialize)]
+#[allow(dead_code)]
 struct FetchKeysCmd {
     cmd: String,
     user_id: String,
 }
 
 #[derive(serde::Deserialize)]
+#[allow(dead_code)]
 struct SendCmd {
     cmd: String,
     envelope: Envelope,
 }
 
 #[derive(serde::Deserialize)]
+#[allow(dead_code)]
 struct ReceiveCmd {
     cmd: String,
     user_id: String,
