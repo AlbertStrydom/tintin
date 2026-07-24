@@ -189,10 +189,82 @@ tintin-ios/
 - No message persistence (sessions stored in UserDefaults)
 - Single device (device_id always 1)
 
+## Phase 3 — Android App (Jetpack Compose + JNI + Rust Core) 🏗️
+
+The `tintin-android/` directory contains a complete Jetpack Compose client that calls into Rust through JNI. The architecture mirrors the iOS app closely.
+
+### How to Build
+
+You need Android Studio, the Android NDK, and the Rust Android targets installed:
+
+```bash
+# 1. Install Rust Android targets and cargo-ndk
+rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+cargo install cargo-ndk
+
+# 2. Set your NDK path (adjust for your system)
+export ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/25.2.9519653
+
+# 3. Build the Rust library for all Android ABIs
+cd tintin-android
+./build_rust.sh
+
+# 4. Open tintin-android/ in Android Studio
+#    Let Gradle sync, then run on device or emulator (min API 26)
+```
+
+### Android App Architecture
+
+```
+tintin-android/
+├── build.gradle.kts           # Root Gradle config
+├── settings.gradle.kts
+├── gradle.properties
+├── build_rust.sh              # Cross-compiles Rust for Android
+├── app/
+│   ├── build.gradle.kts       # App module with Compose deps
+│   └── src/main/
+│       ├── AndroidManifest.xml
+│       ├── res/               # Resources (strings, colors, theme)
+│       └── java/com/tintin/app/
+│           ├── RustBridge.kt           # JNI external declarations
+│           ├── MainActivity.kt         # Composable navigation host
+│           ├── models/
+│           │   ├── ServerConfig.kt
+│           │   ├── UserModel.kt
+│           │   └── MessageModel.kt
+│           ├── services/
+│           │   ├── RelayService.kt     # TCP relay client
+│           │   └── SessionManager.kt   # Crypto handle management
+│           └── ui/
+│               ├── theme/Theme.kt
+│               ├── ConnectScreen.kt
+│               ├── RegisterScreen.kt
+│               ├── ChatListScreen.kt
+│               └── ChatScreen.kt
+```
+
+### App Flow
+
+Same as iOS: **Connect** → **Register** → **Chat List** → **Chat**
+
+### Rust JNI Crate
+
+`tintin-jni/` mirrors `tintin-ffi/` but exposes functions through JNI instead of C:
+
+| Rust function | JNI name |
+|---|---|
+| `identityGenerate` | `Java_com_tintin_app_RustBridge_identityGenerate` |
+| `sessionNewInitiator` | `Java_com_tintin_app_RustBridge_sessionNewInitiator` |
+| `sessionEncrypt` | `Java_com_tintin_app_RustBridge_sessionEncrypt` |
+| ... | ... |
+
+All handles are `jlong` (pointer widths). Tested with 17 + 2 = 19 total passing tests.
+
 ## Roadmap
 
-- **Phase 2**: ✅ iOS SwiftUI app (source complete, needs Mac build) 🏗️
-- **Phase 3**: Android app (Jetpack Compose) with same Rust core
+- **Phase 2**: ✅ iOS SwiftUI app (source complete, needs Mac build)
+- **Phase 3**: ✅ Android Jetpack Compose app (source complete, needs NDK build) 🏗️
 - **Phase 4**: Group chats, voice messages, calls
 - **Phase 5**: Channels, stickers, mini-apps
 

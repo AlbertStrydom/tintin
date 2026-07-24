@@ -1,0 +1,16 @@
+[package]
+name = "tintin-jni"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "JNI bindings for TinTin's Rust core — used by the Android (Jetpack Compose) client"
+
+[lib]
+crate-type = ["cdylib"]
+name = "tintin_android"
+
+[dependencies]
+tintin-core = { path = "../tintin-core" }
+jni = "0.21"
+serde_json.workspace = true
