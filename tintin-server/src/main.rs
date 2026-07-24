@@ -17,7 +17,7 @@
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tintin_core::{Envelope, MessageType};
+use tintin_core::Envelope;
 
 mod store;
 use store::Store;
@@ -294,7 +294,7 @@ async fn handle_receive(value: &serde_json::Value, state: &AppState) -> ServerRe
 #[cfg(test)]
 mod tests {
     use super::*;
-use tintin_core::Envelope;
+    use tintin_core::{Envelope, MessageType};
 
     /// Helper: create an AppState backed by a temporary in-memory database.
     fn test_state() -> Arc<AppState> {

@@ -175,52 +175,19 @@ impl TinTinClient {
     }
 
     /// Send an encrypted message to another user.
+    ///
+    /// Messages to yourself ("Saved Messages") skip encryption and are
+    /// sent as plaintext — no session needed.
     async fn send_message(
         &mut self,
         recipient: &str,
         plaintext: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Track whether this is the first message (new session).
-        let mut is_new = false;
-
-        // Get or create a session with this user.
-        let session = if let Some(s) = self.sessions.get_mut(recipient, 1) {
-            s
+        // Saved Messages — just send raw plaintext, no encryption.
+        let (content, msg_type) = if recipient == self.user_id {
+            (plaintext.as_bytes().to_vec(), MessageType::Normal)
         } else {
-            is_new = true;
-            // Fetch their pre-key bundle and establish a session.
-            let bundle = self.fetch_bundle(recipient).await?;
-            let new_session = Session::new_initiator(
-                IdentityKeyPair {
-                    key_pair: KeyPair {
-                        secret: self.identity.key_pair.secret,
-                        public: self.identity.key_pair.public,
-                    },
-                },
-                recipient.to_string(),
-                1,
-                bundle.identity_key,
-                &bundle.signed_pre_key,
-            )?;
-
-            self.sessions.add(new_session);
-            self.sessions.get_mut(recipient, 1).unwrap()
-        };
-
-        // Encrypt the message using the session's Double Ratchet.
-        let encrypted = session.encrypt(plaintext.as_bytes())?;
-
-        // For the first message, wrap in a PreKeyBundle so the recipient
-        // can create a responder session.
-        let (content, msg_type) = if is_new {
-            let prekey = PreKeyBundleMessage {
-                identity_key: *self.identity.public_key(),
-                base_key: session.ratchet.dh_ratchet_key.public,
-                session_message: encrypted,
-            };
-            (serde_json::to_vec(&prekey)?, MessageType::PreKeyBundle)
-        } else {
-            (encrypted.to_json()?, MessageType::Normal)
+            self.send_encrypted(recipient, plaintext).await?
         };
 
         // Wrap in an envelope and send via the relay.
@@ -253,6 +220,56 @@ impl TinTinClient {
         self.save_history();
         println!("✓ Sent to '{}' (✓)", recipient);
         Ok(())
+    }
+
+    /// Send an E2E encrypted message to another user (not self).
+    async fn send_encrypted(
+        &mut self,
+        recipient: &str,
+        plaintext: &str,
+    ) -> Result<(Vec<u8>, MessageType), Box<dyn std::error::Error>> {
+        // Track whether this is the first message (new session).
+        let mut is_new = false;
+
+        // Get or create a session with this user.
+        let session = if let Some(s) = self.sessions.get_mut(recipient, 1) {
+            s
+        } else {
+            is_new = true;
+            // Fetch their pre-key bundle and establish a session.
+            let bundle = self.fetch_bundle(recipient).await?;
+            let new_session = Session::new_initiator(
+                IdentityKeyPair {
+                    key_pair: KeyPair {
+                        secret: self.identity.key_pair.secret,
+                        public: self.identity.key_pair.public,
+                    },
+                },
+                recipient.to_string(),
+                1,
+                bundle.identity_key,
+                &bundle.signed_pre_key,
+            )?;
+
+            self.sessions.add(new_session);
+            self.sessions.get_mut(recipient, 1).unwrap()
+        };
+
+        // Encrypt the message using the session's Double Ratchet.
+        let encrypted = session.encrypt(plaintext.as_bytes())?;
+
+        // For the first message, wrap in a PreKeyBundle so the recipient
+        // can create a responder session.
+        Ok(if is_new {
+            let prekey = PreKeyBundleMessage {
+                identity_key: *self.identity.public_key(),
+                base_key: session.ratchet.dh_ratchet_key.public,
+                session_message: encrypted,
+            };
+            (serde_json::to_vec(&prekey)?, MessageType::PreKeyBundle)
+        } else {
+            (encrypted.to_json()?, MessageType::Normal)
+        })
     }
 
     /// Poll for and decrypt incoming messages.
@@ -327,6 +344,13 @@ impl TinTinClient {
                     }
                 }
                 MessageType::Normal => {
+                    // Saved Messages (self) — display plaintext directly.
+                    if envelope.sender_id == self.user_id {
+                        let text = String::from_utf8_lossy(&envelope.content);
+                        println!("📝 Saved: {}", text);
+                        continue;
+                    }
+
                     let session_msg = match SessionMessage::from_json(&envelope.content) {
                         Ok(m) => m,
                         Err(e) => {
@@ -501,6 +525,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Available commands:");
     println!("  /msg username text  — Send an E2E encrypted message");
     println!("         Example: /msg bob Hello Bob!");
+    println!("  /msg <yourname> ... — Saved Messages (message yourself)");
     println!("  /recv               — Check for new messages");
     println!("  /status             — Show sent message status (✓/✓✓)");
     println!("  /help               — Show this help");
@@ -531,6 +556,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Commands:");
             println!("  /msg username text  — Send an E2E encrypted message");
             println!("         Example: /msg bob Hello Bob!");
+            println!("  /msg <yourname> ... — Saved Messages (message yourself)");
             println!("  /recv               — Poll for new messages");
             println!("  /status             — Show sent message status (✓/✓✓)");
             println!("  /help               — Show this help");
