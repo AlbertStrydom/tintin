@@ -1795,13 +1795,32 @@ impl TinTinClient {
         Ok(resp["data"]["stories"].as_array().cloned().unwrap_or_default())
     }
 
-    // ── File Sharing ───────────────────────────────────────────
+    // ── File Sharing / Voice Messages ──────────────────────────
 
     /// Send a file to another user (chunked, E2E encrypted).
     async fn send_file(
         &mut self,
         recipient: &str,
         file_path: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.send_file_inner(recipient, file_path, "file").await
+    }
+
+    /// Send a voice message (audio file, marked as voice).
+    async fn send_voice(
+        &mut self,
+        recipient: &str,
+        file_path: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.send_file_inner(recipient, file_path, "voice").await
+    }
+
+    /// Core: send a file (or voice) in chunks.
+    async fn send_file_inner(
+        &mut self,
+        recipient: &str,
+        file_path: &str,
+        msg_type: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let path = std::path::Path::new(file_path);
         let file_name = path
@@ -1828,7 +1847,8 @@ impl TinTinClient {
         );
 
         println!(
-            "📤 Sending '{}' ({} KB, {} chunk(s))...",
+            "{} Sending '{}' ({} KB, {} chunk(s))...",
+            if msg_type == "voice" { "🎤" } else { "📤" },
             file_name,
             file_size / 1024,
             total_chunks
@@ -1836,7 +1856,7 @@ impl TinTinClient {
 
         for (i, chunk) in file_data.chunks(CHUNK_SIZE).enumerate() {
             let payload = serde_json::json!({
-                "__tintin_type": "file",
+                "__tintin_type": msg_type,
                 "file_id": file_id,
                 "file_name": file_name,
                 "file_size": file_size,
@@ -1894,9 +1914,10 @@ impl TinTinClient {
         }
 
         // Track in sent messages.
+        let file_label = if msg_type == "voice" { format!("🎤 Voice ({})", file_name) } else { format!("📁 {} ({} KB)", file_name, file_size / 1024) };
         self.sent_messages.push(SentMessage {
             recipient: recipient.to_string(),
-            text: format!("📁 {} ({} KB)", file_name, file_size / 1024),
+            text: file_label,
             timestamp: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
@@ -1905,12 +1926,12 @@ impl TinTinClient {
             edited: false,
         });
         self.save_history();
-        println!("✓ Sent '{}' to '{}'", file_name, recipient);
+        println!("✓ Sent {} to '{}'", file_name, recipient);
         Ok(())
     }
 
-    /// Process an incoming decrypted message that may be a file chunk.
-    /// Returns true if it was a file chunk (already displayed).
+    /// Process an incoming decrypted message that may be a file or voice chunk.
+    /// Returns true if it was a chunk (already displayed).
     fn process_file_chunk(
         &mut self,
         sender: &str,
@@ -1920,9 +1941,13 @@ impl TinTinClient {
             Ok(v) => v,
             Err(_) => return false,
         };
-        if payload.get("__tintin_type").and_then(|v| v.as_str()) != Some("file") {
+        let chunk_type = payload.get("__tintin_type").and_then(|v| v.as_str());
+        if chunk_type != Some("file") && chunk_type != Some("voice") {
             return false;
         }
+
+        let is_voice = chunk_type == Some("voice");
+        let type_label = if is_voice { "🎤 Voice" } else { "📁" };
 
         let file_id = payload["file_id"].as_str().unwrap_or("").to_string();
         let file_name = payload["file_name"].as_str().unwrap_or("unknown").to_string();
@@ -1938,8 +1963,8 @@ impl TinTinClient {
 
         // Get or create pending file entry.
         let pending = self.pending_files.entry(file_id.clone()).or_insert_with(|| {
-            println!("📁 Receiving '{}' ({} KB, {} chunks) from {}...",
-                file_name, file_size / 1024, total_chunks, sender);
+            println!("{} Receiving '{}' ({} KB, {} chunks) from {}...",
+                type_label, file_name, file_size / 1024, total_chunks, sender);
             PendingFile {
                 file_name: file_name.clone(),
                 file_size,
@@ -1971,7 +1996,8 @@ impl TinTinClient {
                 eprintln!("⚠️ Could not save file '{}': {}", name, e);
             } else {
                 println!(
-                    "✅ File '{}' saved ({} KB) → {}",
+                    "✅ {} '{}' saved ({} KB) → {}",
+                    if is_voice { "🎤 Voice" } else { "📁 File" },
                     name,
                     size / 1024,
                     out_path.display()
@@ -2113,7 +2139,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  /group send id text — Send to a group");
             println!("  /edit <idx> text    — Edit a sent message");
             println!("  /search <text>       — Search message history");
-            println!("  /sendfile <user> <path> — Send a file (E2E encrypted, chunked)");
+    println!("  /sendfile <user> <path> — Send a file (E2E encrypted, chunked)");
+    println!("  /voice <user> <path>    — Send a voice message (audio file)");
             println!("  /channel create <name>  — Create a broadcast channel");
             println!("  /channel sub <id>       — Subscribe to a channel");
             println!("  /channel unsub <id>     — Unsubscribe from a channel");
@@ -2762,6 +2789,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             if let Err(e) = client.send_file(parts[0], parts[1]).await {
+                eprintln!("Error: {e}");
+            }
+            continue;
+        }
+
+        if let Some(rest) = input.strip_prefix("/voice ") {
+            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+            if parts.len() < 2 {
+                eprintln!("Usage: /voice <user> <audiopath>");
+                continue;
+            }
+            if let Err(e) = client.send_voice(parts[0], parts[1]).await {
                 eprintln!("Error: {e}");
             }
             continue;

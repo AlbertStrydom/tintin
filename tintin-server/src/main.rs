@@ -31,12 +31,14 @@ const DB_PATH: &str = "tintin-server.db";
 
 #[tokio::main]
 async fn main() {
-    let addr = "127.0.0.1:9666";
+    let db_path = std::env::var("TINTIN_DB_PATH").unwrap_or_else(|_| DB_PATH.to_string());
+    let addr = "0.0.0.0:9666";
     let listener = TcpListener::bind(addr)
         .await
         .expect("Failed to bind to address");
+    eprintln!("TinTin relay server listening on {addr}");
 
-    let store = Store::open(DB_PATH).expect("Failed to open database");
+    let store = Store::open(&db_path).expect("Failed to open database");
 
     let state = Arc::new(AppState { store });
 
@@ -1192,9 +1194,9 @@ mod tests {
     fn test_state() -> Arc<AppState> {
         use std::time::{SystemTime, UNIX_EPOCH};
         let path = std::env::temp_dir().join(format!(
-            "tintin-test-{}-{}.db",
+            "tintin-test-{}-{:?}.db",
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
-            std::process::id(),
+            std::thread::current().id(),
         ));
         let path_str = path.to_str().unwrap();
         let store = Store::open(path_str).expect("Failed to create test store");

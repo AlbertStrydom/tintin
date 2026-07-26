@@ -1,0 +1,14 @@
+services:
+  tintin-server:
+    build: .
+    container_name: tintin-relay
+    ports:
+      - "9666:9666"
+    volumes:
+      - tintin-data:/data
+    environment:
+      TINTIN_DB_PATH: /data/tintin-server.db
+    restart: unless-stopped
+
+volumes:
+  tintin-data:
