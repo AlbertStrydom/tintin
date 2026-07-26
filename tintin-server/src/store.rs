@@ -59,6 +59,28 @@ impl Store {
         Ok(())
     }
 
+    /// List registered user IDs, optionally filtered by a search query.
+    pub fn list_users(&self, query: Option<&str>) -> Result<Vec<String>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+
+        let users = if let Some(q) = query {
+            let pattern = format!("%{}%", q);
+            let mut stmt = conn.prepare(
+                "SELECT user_id FROM users WHERE user_id LIKE ?1 ORDER BY user_id",
+            )?;
+            stmt.query_map(params![pattern], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect()
+        } else {
+            let mut stmt = conn.prepare("SELECT user_id FROM users ORDER BY user_id")?;
+            stmt.query_map([], |row| row.get(0))?
+                .filter_map(|r| r.ok())
+                .collect()
+        };
+
+        Ok(users)
+    }
+
     /// Retrieve a registered user's key bundle, or `None` if unknown.
     pub fn get_key_bundle(&self, user_id: &str) -> Result<Option<serde_json::Value>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();

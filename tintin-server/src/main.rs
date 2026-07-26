@@ -126,6 +126,14 @@ struct ReceiveCmd {
     user_id: String,
 }
 
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct ListUsersCmd {
+    cmd: String,
+    #[serde(default)]
+    query: Option<String>,
+}
+
 async fn handle_command(line: &str, state: &AppState) -> ServerResponse {
     let value: serde_json::Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -154,6 +162,7 @@ async fn handle_command(line: &str, state: &AppState) -> ServerResponse {
         "fetch_keys" => handle_fetch_keys(&value, state).await,
         "send" => handle_send(&value, state).await,
         "receive" => handle_receive(&value, state).await,
+        "list_users" => handle_list_users(&value, state).await,
         _ => ServerResponse {
             status: "error".to_string(),
             data: None,
@@ -280,6 +289,35 @@ async fn handle_receive(value: &serde_json::Value, state: &AppState) -> ServerRe
             ServerResponse {
                 status: "ok".to_string(),
                 data: Some(serde_json::json!({"messages": messages})),
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+async fn handle_list_users(value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    let cmd: ListUsersCmd = match serde_json::from_value(value.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return ServerResponse {
+                status: "error".to_string(),
+                data: None,
+                error: Some(format!("Invalid payload: {e}")),
+            }
+        }
+    };
+
+    match state.store.list_users(cmd.query.as_deref()) {
+        Ok(users) => {
+            eprintln!("  → {} user(s) listed", users.len());
+            ServerResponse {
+                status: "ok".to_string(),
+                data: Some(serde_json::json!({"users": users})),
                 error: None,
             }
         }
@@ -454,8 +492,49 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_file(&path);
-        // Also clean up WAL / SHM files that SQLite may have created.
         let _ = std::fs::remove_file(format!("{path}-wal"));
         let _ = std::fs::remove_file(format!("{path}-shm"));
+    }
+
+    #[tokio::test]
+    async fn test_list_users() {
+        let state = test_state();
+
+        // No users yet.
+        let list = serde_json::json!({"cmd": "list_users"});
+        let resp = handle_command(&list.to_string(), &state).await;
+        assert_eq!(resp.status, "ok");
+        let data = resp.data.unwrap();
+        let users = data["users"].as_array().unwrap();
+        assert!(users.is_empty(), "should start empty");
+
+        // Register alice.
+        let identity_key: Vec<u8> = vec![0u8; 32];
+        let spk_pub: Vec<u8> = vec![1u8; 32];
+        let spk_sig: Vec<u8> = vec![2u8; 64];
+        let register = serde_json::json!({
+            "cmd": "register",
+            "user_id": "alice",
+            "identity_key": identity_key,
+            "signed_pre_key": {
+                "identity_key": identity_key,
+                "device_id": 1,
+                "signed_pre_key_id": 1,
+                "signed_pre_key": spk_pub,
+                "signed_pre_key_signature": spk_sig,
+                "one_time_pre_key_id": null,
+                "one_time_pre_key": null
+            }
+        });
+        let resp = handle_command(&register.to_string(), &state).await;
+        assert_eq!(resp.status, "ok");
+
+        // Now list_users should include alice.
+        let resp = handle_command(&list.to_string(), &state).await;
+        assert_eq!(resp.status, "ok");
+        let data = resp.data.unwrap();
+        let users = data["users"].as_array().unwrap();
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].as_str().unwrap(), "alice");
     }
 }

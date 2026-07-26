@@ -486,6 +486,23 @@ impl TinTinClient {
         Ok(())
     }
 
+    /// List all registered users on the server.
+    async fn list_users(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let request = serde_json::json!({ "cmd": "list_users" });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed to list users: {}", resp["error"]).into());
+        }
+        let users: Vec<String> = resp["data"]["users"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        Ok(users)
+    }
+
     /// Receive a raw JSON value from the server.
     async fn recv_json(&self) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
         if let Some(reader) = &self.reader {
@@ -527,6 +544,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("         Example: /msg bob Hello Bob!");
     println!("  /msg <yourname> ... — Saved Messages (message yourself)");
     println!("  /recv               — Check for new messages");
+    println!("  /users              — List registered users");
     println!("  /status             — Show sent message status (✓/✓✓)");
     println!("  /help               — Show this help");
     println!("  /quit               — Exit");
@@ -558,6 +576,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("         Example: /msg bob Hello Bob!");
             println!("  /msg <yourname> ... — Saved Messages (message yourself)");
             println!("  /recv               — Poll for new messages");
+            println!("  /users              — List registered users");
             println!("  /status             — Show sent message status (✓/✓✓)");
             println!("  /help               — Show this help");
             println!("  /quit               — Exit");
@@ -584,6 +603,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
                     println!("  {status} {} → {} ({})", msg.text, msg.recipient, status);
                 }
+            }
+            continue;
+        }
+
+        if input == "/users" {
+            match client.list_users().await {
+                Ok(users) => {
+                    if users.is_empty() {
+                        println!("No registered users.");
+                    } else {
+                        println!("Registered users ({}):", users.len());
+                        for u in &users {
+                            let me = if u == &client.user_id { " (you)" } else { "" };
+                            println!("  - {}{}", u, me);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Error: {e}"),
             }
             continue;
         }
