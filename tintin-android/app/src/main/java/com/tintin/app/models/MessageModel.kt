@@ -6,7 +6,7 @@ import java.util.UUID
 enum class MessageDirection { Outgoing, Incoming }
 
 enum class StructuredType {
-    Group, Channel, Poll, Sticker, CallOffer, CallAccept, CallEnd, Edit, File
+    Group, Channel, Poll, Sticker, CallOffer, CallAccept, CallEnd, Edit, File, Voice
 }
 
 data class MessageModel(
@@ -24,6 +24,7 @@ data class MessageModel(
     val fileName: String? = null,
     val fileSize: Long? = null,
     val isEdited: Boolean = false,
+    val voiceFileName: String? = null,
 ) {
     companion object {
         /** Parse a __tintin_type payload into display info. */
@@ -57,6 +58,10 @@ data class MessageModel(
                     val fn = payload["file_name"] as? String ?: "File"
                     ParseResult("📁 File: $fn", StructuredType.File, fileName = fn)
                 }
+                "voice" -> {
+                    val fn = payload["file_name"] as? String ?: "Voice"
+                    ParseResult("🎤 Voice: $fn", StructuredType.Voice, voiceFileName = fn)
+                }
                 else -> ParseResult(payload["text"] as? String ?: "", null)
             }
         }
@@ -69,6 +74,7 @@ data class MessageModel(
             val pollQuestion: String? = null,
             val stickerEmoji: String? = null,
             val fileName: String? = null,
+            val voiceFileName: String? = null,
         )
     }
 }

@@ -196,7 +196,8 @@ struct ChatListView: View {
                                 groupName: parsed.groupName,
                                 channelName: parsed.channelName,
                                 pollQuestion: parsed.pollQuestion,
-                                stickerEmoji: parsed.stickerEmoji
+                                stickerEmoji: parsed.stickerEmoji,
+                                voiceFileName: parsed.voiceFileName
                             )
                             await MainActor.run {
                                 if !appState.contacts.contains(where: { $0.id == senderId }) {

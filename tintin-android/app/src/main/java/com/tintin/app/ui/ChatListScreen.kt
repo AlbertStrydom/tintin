@@ -185,6 +185,7 @@ private fun handleIncoming(appState: AppState, env: EnvelopeResponse) {
                         pollQuestion = parsed.pollQuestion,
                         stickerEmoji = parsed.stickerEmoji,
                         fileName = parsed.fileName,
+                        voiceFileName = parsed.voiceFileName,
                     )
                 } else {
                     MessageModel(senderId = remoteId, text = text, direction = com.tintin.app.models.MessageDirection.Incoming)

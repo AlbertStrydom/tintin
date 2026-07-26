@@ -331,6 +331,53 @@ actor RelayService {
     }
 
     // ------------------------------------------------------------------
+    // Timeline / Moments
+    // ------------------------------------------------------------------
+
+    func createPost(userId: String, content: String, targetUserId: String? = nil) async throws -> Int64 {
+        var payload: [String: Any] = ["cmd": "create_post", "user_id": userId, "content": content]
+        if let target = targetUserId { payload["target_user_id"] = target }
+        let resp: ServerResponse = try await sendCommand(payload)
+        guard resp.status == "ok" else {
+            throw RelayError.serverError(resp.error ?? "create_post failed")
+        }
+        return 0
+    }
+
+    func getTimeline(userId: String) async throws -> [[String: Any]] {
+        let payload: [String: String] = ["cmd": "get_timeline", "user_id": userId]
+        let resp: ServerResponse = try await sendCommand(payload)
+        guard resp.status == "ok" else {
+            throw RelayError.serverError(resp.error ?? "get_timeline failed")
+        }
+        return []
+    }
+
+    func addComment(postId: Int64, userId: String, content: String) async throws {
+        let payload: [String: Any] = ["cmd": "add_comment", "post_id": postId, "user_id": userId, "content": content]
+        let resp: ServerResponse = try await sendCommand(payload)
+        guard resp.status == "ok" else {
+            throw RelayError.serverError(resp.error ?? "add_comment failed")
+        }
+    }
+
+    func deletePost(postId: Int64, userId: String) async throws {
+        let payload: [String: Any] = ["cmd": "delete_post", "post_id": postId, "user_id": userId]
+        let resp: ServerResponse = try await sendCommand(payload)
+        guard resp.status == "ok" else {
+            throw RelayError.serverError(resp.error ?? "delete_post failed")
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Voice Messages
+    // ------------------------------------------------------------------
+
+    func sendVoice(envelope: [String: Any]) async throws {
+        try await send(envelope: envelope)
+    }
+
+    // ------------------------------------------------------------------
     // Low-level send / receive (line-delimited JSON over TCP)
     // ------------------------------------------------------------------
 

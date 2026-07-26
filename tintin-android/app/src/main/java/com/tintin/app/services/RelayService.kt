@@ -192,6 +192,49 @@ class RelayService(private val host: String, private val port: Int) {
     }
 
     // ------------------------------------------------------------------
+    // Timeline / Moments
+    // ------------------------------------------------------------------
+
+    suspend fun createPost(userId: String, content: String, targetUserId: String? = null): Result<Long> = withContext(Dispatchers.IO) {
+        try {
+            val m = mutableMapOf<String, Any>("cmd" to "create_post", "user_id" to userId, "content" to content)
+            targetUserId?.let { m["target_user_id"] = it }
+            val resp = sendJsonGet(m as Map<String, Any>)
+            val obj = JsonParser.parseString(resp).asJsonObject
+            if (obj.get("status")?.asString != "ok") {
+                return@withContext Result.failure(Exception(obj.get("error")?.asString))
+            }
+            Result.success(obj.getAsJsonObject("data")?.get("post_id")?.asLong ?: 0)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun getTimeline(userId: String): Result<List<Map<String, Any>>> = withContext(Dispatchers.IO) {
+        try {
+            val resp = sendJsonGet(mapOf("cmd" to "get_timeline", "user_id" to userId))
+            val obj = JsonParser.parseString(resp).asJsonObject
+            if (obj.get("status")?.asString != "ok") {
+                return@withContext Result.failure(Exception(obj.get("error")?.asString))
+            }
+            val posts = obj.getAsJsonObject("data")?.getAsJsonArray("posts")
+                ?.map { it.asJsonObject.entrySet().associate { (k, v) -> k to (v.asString ?: v.toString()) } }
+                ?: emptyList()
+            Result.success(posts)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun addComment(postId: Long, userId: String, content: String): Result<Unit> = sendCommand {
+        mapOf("cmd" to "add_comment", "post_id" to postId, "user_id" to userId, "content" to content)
+    }
+
+    suspend fun deletePost(postId: Long, userId: String): Result<Unit> = sendCommand {
+        mapOf("cmd" to "delete_post", "post_id" to postId, "user_id" to userId)
+    }
+
+    // ------------------------------------------------------------------
     // Status / Stories
     // ------------------------------------------------------------------
 
