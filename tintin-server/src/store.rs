@@ -95,7 +95,28 @@ impl Store {
                 user_id         TEXT NOT NULL,
                 option_id       INTEGER NOT NULL,
                 PRIMARY KEY (poll_id, user_id)
-            );",
+            );
+
+            CREATE TABLE IF NOT EXISTS timeline_posts (
+                post_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id         TEXT NOT NULL,
+                content         TEXT NOT NULL,
+                created_at      INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS timeline_comments (
+                comment_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                post_id         INTEGER NOT NULL REFERENCES timeline_posts(post_id),
+                user_id         TEXT NOT NULL,
+                content         TEXT NOT NULL,
+                created_at      INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_timeline_posts_user
+                ON timeline_posts(user_id);
+
+            CREATE INDEX IF NOT EXISTS idx_timeline_comments_post
+                ON timeline_comments(post_id);",
         )?;
 
         Ok(Store {
@@ -652,5 +673,111 @@ impl Store {
             Some(_) => Ok(false), // not the creator
             None => Ok(false),    // not found
         }
+    }
+
+    // ── Timeline / Moments ────────────────────────────────────
+
+    /// Post to timeline. Returns the post_id.
+    pub fn create_post(&self, user_id: &str, content: &str) -> Result<i64, rusqlite::Error> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO timeline_posts (user_id, content, created_at) VALUES (?1, ?2, ?3)",
+            params![user_id, content, ts],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Delete a post (owner only).
+    pub fn delete_post(&self, post_id: i64, user_id: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn.execute(
+            "DELETE FROM timeline_posts WHERE post_id = ?1 AND user_id = ?2",
+            params![post_id, user_id],
+        )?;
+        if affected > 0 {
+            // Also delete comments
+            conn.execute("DELETE FROM timeline_comments WHERE post_id = ?1", params![post_id])?;
+        }
+        Ok(affected > 0)
+    }
+
+    /// Get timeline: posts from the given user's contacts plus own posts,
+    /// newest first. Also returns comment count per post.
+    pub fn get_timeline(&self, user_id: &str) -> Result<Vec<serde_json::Value>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+
+        // Get contacts (anyone the user has talked to or vice versa).
+        // For simplicity, we get users from group_members and messages.
+        // We also include the user's own posts.
+
+        let mut stmt = conn.prepare(
+            "SELECT p.post_id, p.user_id, p.content, p.created_at,
+                    (SELECT COUNT(*) FROM timeline_comments WHERE post_id = p.post_id) as comment_count
+             FROM timeline_posts p
+             WHERE p.user_id = ?1
+                OR p.user_id IN (
+                    SELECT DISTINCT user_id FROM group_members WHERE group_id IN
+                        (SELECT group_id FROM group_members WHERE user_id = ?1)
+                    UNION
+                    SELECT DISTINCT sender_id FROM messages WHERE recipient_id = ?1
+                    UNION
+                    SELECT DISTINCT recipient_id FROM messages WHERE recipient_id = ?1
+                )
+             ORDER BY p.created_at DESC
+             LIMIT 100",
+        )?;
+
+        let posts = stmt
+            .query_map(params![user_id], |row| {
+                Ok(serde_json::json!({
+                    "post_id": row.get::<_, i64>(0)?,
+                    "user_id": row.get::<_, String>(1)?,
+                    "content": row.get::<_, String>(2)?,
+                    "created_at": row.get::<_, i64>(3)?,
+                    "comment_count": row.get::<_, i64>(4)?,
+                }))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(posts)
+    }
+
+    /// Add a comment to a post.
+    pub fn add_comment(&self, post_id: i64, user_id: &str, content: &str) -> Result<i64, rusqlite::Error> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO timeline_comments (post_id, user_id, content, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![post_id, user_id, content, ts],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Get comments for a post.
+    pub fn get_comments(&self, post_id: i64) -> Result<Vec<serde_json::Value>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT comment_id, user_id, content, created_at
+             FROM timeline_comments WHERE post_id = ?1 ORDER BY created_at",
+        )?;
+        let comments = stmt
+            .query_map(params![post_id], |row| {
+                Ok(serde_json::json!({
+                    "comment_id": row.get::<_, i64>(0)?,
+                    "user_id": row.get::<_, String>(1)?,
+                    "content": row.get::<_, String>(2)?,
+                    "created_at": row.get::<_, i64>(3)?,
+                }))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(comments)
     }
 }

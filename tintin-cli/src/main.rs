@@ -1312,6 +1312,83 @@ impl TinTinClient {
         Ok(())
     }
 
+    // ── Timeline / Moments ────────────────────────────────────
+
+    /// Post to your timeline.
+    async fn post_to_timeline(&self, content: &str) -> Result<i64, Box<dyn std::error::Error>> {
+        let request = serde_json::json!({
+            "cmd": "create_post",
+            "user_id": self.user_id,
+            "content": content,
+        });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed to post: {}", resp["error"]).into());
+        }
+        Ok(resp["data"]["post_id"].as_i64().unwrap_or(0))
+    }
+
+    /// Get timeline posts.
+    async fn get_timeline_posts(&self) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        let request = serde_json::json!({
+            "cmd": "get_timeline",
+            "user_id": self.user_id,
+        });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed: {}", resp["error"]).into());
+        }
+        Ok(resp["data"]["posts"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// Comment on a post.
+    async fn add_comment(&self, post_id: i64, content: &str) -> Result<i64, Box<dyn std::error::Error>> {
+        let request = serde_json::json!({
+            "cmd": "add_comment",
+            "post_id": post_id,
+            "user_id": self.user_id,
+            "content": content,
+        });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed: {}", resp["error"]).into());
+        }
+        Ok(resp["data"]["comment_id"].as_i64().unwrap_or(0))
+    }
+
+    /// Get comments for a post.
+    async fn get_post_comments(&self, post_id: i64) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        let request = serde_json::json!({
+            "cmd": "get_comments",
+            "post_id": post_id,
+        });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed: {}", resp["error"]).into());
+        }
+        Ok(resp["data"]["comments"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// Delete a post.
+    async fn delete_post(&self, post_id: i64) -> Result<(), Box<dyn std::error::Error>> {
+        let request = serde_json::json!({
+            "cmd": "delete_post",
+            "post_id": post_id,
+            "user_id": self.user_id,
+        });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed: {}", resp["error"]).into());
+        }
+        println!("🗑️ Post {} deleted", post_id);
+        Ok(())
+    }
+
     // ── Call methods ──────────────────────────────────────────
 
     /// Initiate a call to another user.
@@ -1977,6 +2054,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  /poll close <id>                — Close a poll (creator only)");
     println!("  /polls                          — List active polls");
     println!("  /sticker <user> <pack> <id> — Send an emoji sticker");
+    println!("  /moment <text>          — Post to your timeline");
+    println!("  /timeline               — View your timeline");
+    println!("  /comment <id> <text>    — Comment on a timeline post");
+    println!("  /postcomments <id>      — View comments on a post");
+    println!("  /deletepost <id>        — Delete your post");
     println!("  /qr                       — Show your contact QR code");
     println!("  /scan <uri>               — Scan a contact QR URI");
     println!("  /call <user>                — Start an encrypted call");
@@ -2037,6 +2119,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  /poll close <id>                — Close a poll (creator only)");
             println!("  /polls                          — List active polls");
             println!("  /sticker <user> <pack> <id> — Send an emoji sticker");
+            println!("  /moment <text>          — Post to your timeline");
+            println!("  /timeline               — View your timeline");
+            println!("  /comment <id> <text>    — Comment on a timeline post");
+            println!("  /postcomments <id>      — View comments on a post");
+            println!("  /deletepost <id>        — Delete your post");
             println!("  /qr                       — Show your contact QR code");
             println!("  /scan <uri>               — Scan a contact QR URI");
             println!("  /call <user>                — Start an encrypted call");
@@ -2534,6 +2621,94 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if input == "/end" || input == "/hangup" {
             if let Err(e) = client.end_call("ended").await {
+                eprintln!("Error: {e}");
+            }
+            continue;
+        }
+
+        if let Some(rest) = input.strip_prefix("/moment ") {
+            let content = rest.trim();
+            if content.is_empty() {
+                eprintln!("Usage: /moment <text>");
+                continue;
+            }
+            match client.post_to_timeline(content).await {
+                Ok(id) => println!("📝 Posted to timeline (id: {})", id),
+                Err(e) => eprintln!("Error: {e}"),
+            }
+            continue;
+        }
+
+        if input == "/timeline" || input == "/tl" {
+            match client.get_timeline_posts().await {
+                Ok(posts) => {
+                    if posts.is_empty() {
+                        println!("Your timeline is empty. Post with /moment <text>");
+                    } else {
+                        println!("─── Timeline ───");
+                        for p in &posts {
+                            let uid = p["user_id"].as_str().unwrap_or("?");
+                            let content = p["content"].as_str().unwrap_or("");
+                            let cc = p["comment_count"].as_i64().unwrap_or(0);
+                            println!("[{}] {}: {}", p["post_id"], uid, content);
+                            if cc > 0 {
+                                println!("     💬 {} comment(s) — /postcomments {}", cc, p["post_id"]);
+                            }
+                            println!("     /comment {} <text> to reply", p["post_id"]);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Error: {e}"),
+            }
+            continue;
+        }
+
+        if let Some(rest) = input.strip_prefix("/comment ") {
+            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+            if parts.len() < 2 {
+                eprintln!("Usage: /comment <post_id> <text>");
+                continue;
+            }
+            let pid: i64 = match parts[0].parse() {
+                Ok(v) => v,
+                Err(_) => { eprintln!("Invalid post id"); continue; }
+            };
+            match client.add_comment(pid, parts[1]).await {
+                Ok(_) => println!("💬 Comment added"),
+                Err(e) => eprintln!("Error: {e}"),
+            }
+            continue;
+        }
+
+        if let Some(rest) = input.strip_prefix("/postcomments ") {
+            let pid: i64 = match rest.trim().parse() {
+                Ok(v) => v,
+                Err(_) => { eprintln!("Usage: /postcomments <post_id>"); continue; }
+            };
+            match client.get_post_comments(pid).await {
+                Ok(comments) => {
+                    if comments.is_empty() {
+                        println!("No comments on post {}", pid);
+                    } else {
+                        println!("─── Comments on post {} ───", pid);
+                        for c in &comments {
+                            let uid = c["user_id"].as_str().unwrap_or("?");
+                            let text = c["content"].as_str().unwrap_or("");
+                            println!("  {}: {}", uid, text);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Error: {e}"),
+            }
+            continue;
+        }
+
+        if let Some(rest) = input.strip_prefix("/deletepost ") {
+            let pid: i64 = match rest.trim().parse() {
+                Ok(v) => v,
+                Err(_) => { eprintln!("Usage: /deletepost <post_id>"); continue; }
+            };
+            if let Err(e) = client.delete_post(pid).await {
                 eprintln!("Error: {e}");
             }
             continue;

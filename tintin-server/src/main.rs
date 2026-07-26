@@ -307,6 +307,11 @@ async fn handle_command(line: &str, state: &AppState) -> ServerResponse {
         "poll_results" => handle_poll_results(&value, state).await,
         "list_polls" => handle_list_polls(&value, state).await,
         "close_poll" => handle_close_poll(&value, state).await,
+        "create_post" => handle_create_post(&value, state).await,
+        "get_timeline" => handle_get_timeline(&value, state).await,
+        "add_comment" => handle_add_comment(&value, state).await,
+        "delete_post" => handle_delete_post(&value, state).await,
+        "get_comments" => handle_get_comments(&value, state).await,
         _ => ServerResponse {
             status: "error".to_string(),
             data: None,
@@ -1002,6 +1007,175 @@ async fn handle_close_poll(value: &serde_json::Value, state: &AppState) -> Serve
         Err(e) => ServerResponse {
             status: "error".to_string(),
             data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+// ── Timeline / Moments ────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct CreatePostCmd {
+    cmd: String,
+    user_id: String,
+    content: String,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct TimelineCmd {
+    cmd: String,
+    user_id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct AddCommentCmd {
+    cmd: String,
+    post_id: i64,
+    user_id: String,
+    content: String,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct PostIdCmd {
+    cmd: String,
+    post_id: i64,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct DeletePostCmd {
+    cmd: String,
+    post_id: i64,
+    user_id: String,
+}
+
+async fn handle_create_post(value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    let cmd: CreatePostCmd = match serde_json::from_value(value.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return ServerResponse {
+                status: "error".to_string(), data: None,
+                error: Some(format!("Invalid payload: {e}")),
+            }
+        }
+    };
+    match state.store.create_post(&cmd.user_id, &cmd.content) {
+        Ok(post_id) => {
+            eprintln!("  📝 {} posted to timeline (id={})", cmd.user_id, post_id);
+            ServerResponse {
+                status: "ok".to_string(),
+                data: Some(serde_json::json!({"post_id": post_id})),
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(), data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+async fn handle_get_timeline(value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    let cmd: TimelineCmd = match serde_json::from_value(value.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return ServerResponse {
+                status: "error".to_string(), data: None,
+                error: Some(format!("Invalid payload: {e}")),
+            }
+        }
+    };
+    match state.store.get_timeline(&cmd.user_id) {
+        Ok(posts) => {
+            ServerResponse {
+                status: "ok".to_string(),
+                data: Some(serde_json::json!({"posts": posts})),
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(), data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+async fn handle_add_comment(value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    let cmd: AddCommentCmd = match serde_json::from_value(value.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return ServerResponse {
+                status: "error".to_string(), data: None,
+                error: Some(format!("Invalid payload: {e}")),
+            }
+        }
+    };
+    match state.store.add_comment(cmd.post_id, &cmd.user_id, &cmd.content) {
+        Ok(comment_id) => {
+            eprintln!("  💬 {} commented on post {}", cmd.user_id, cmd.post_id);
+            ServerResponse {
+                status: "ok".to_string(),
+                data: Some(serde_json::json!({"comment_id": comment_id})),
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(), data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+async fn handle_delete_post(value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    let cmd: DeletePostCmd = match serde_json::from_value(value.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return ServerResponse {
+                status: "error".to_string(), data: None,
+                error: Some(format!("Invalid payload: {e}")),
+            }
+        }
+    };
+    match state.store.delete_post(cmd.post_id, &cmd.user_id) {
+        Ok(true) => {
+            eprintln!("  🗑️ Post {} deleted by {}", cmd.post_id, cmd.user_id);
+            ServerResponse { status: "ok".to_string(), data: None, error: None }
+        }
+        Ok(false) => ServerResponse {
+            status: "error".to_string(), data: None,
+            error: Some("Post not found or not yours".to_string()),
+        },
+        Err(e) => ServerResponse {
+            status: "error".to_string(), data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+async fn handle_get_comments(value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    let cmd: PostIdCmd = match serde_json::from_value(value.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return ServerResponse {
+                status: "error".to_string(), data: None,
+                error: Some(format!("Invalid payload: {e}")),
+            }
+        }
+    };
+    match state.store.get_comments(cmd.post_id) {
+        Ok(comments) => {
+            ServerResponse {
+                status: "ok".to_string(),
+                data: Some(serde_json::json!({"comments": comments})),
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(), data: None,
             error: Some(format!("Database error: {e}")),
         },
     }
