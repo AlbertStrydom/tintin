@@ -35,6 +35,25 @@ struct SentMessage {
     edited: bool,
 }
 
+/// Direction of a chat message.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+enum MessageDirection {
+    Outgoing,
+    Incoming,
+}
+
+/// A single message in the chat log (incoming or outgoing).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct MessageRecord {
+    peer: String,
+    text: String,
+    timestamp: u64,
+    direction: MessageDirection,
+    is_group: bool,
+    group_name: Option<String>,
+    edited: bool,
+}
+
 /// A group we belong to.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct GroupInfo {
@@ -62,6 +81,8 @@ struct TinTinClient {
     sent_messages: Vec<SentMessage>,
     /// Groups we belong to (group_id -> info).
     groups: HashMap<String, GroupInfo>,
+    /// Full chat log for search.
+    chat_log: Vec<MessageRecord>,
 }
 
 impl TinTinClient {
@@ -79,9 +100,11 @@ impl TinTinClient {
             reader: None,
             sent_messages: Vec::new(),
             groups: HashMap::new(),
+            chat_log: Vec::new(),
         };
         client.load_history();
         client.load_groups();
+        client.load_chat_log();
         client
     }
 
@@ -155,6 +178,54 @@ impl TinTinClient {
         if let Ok(json) = serde_json::to_string_pretty(&self.groups) {
             let _ = std::fs::write(&path, &json);
         }
+    }
+
+    // ── Chat log persistence ────────────────────────────────────
+
+    fn chat_log_path(&self) -> PathBuf {
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_else(|_| ".".to_string());
+        let dir = PathBuf::from(home).join(".tintin");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(format!("{}_chatlog.json", self.user_id))
+    }
+
+    fn load_chat_log(&mut self) {
+        let path = self.chat_log_path();
+        if !path.exists() {
+            return;
+        }
+        if let Ok(json) = std::fs::read_to_string(&path) {
+            if let Ok(log) = serde_json::from_str::<Vec<MessageRecord>>(&json) {
+                self.chat_log = log;
+            }
+        }
+    }
+
+    fn save_chat_log(&self) {
+        let path = self.chat_log_path();
+        if let Ok(json) = serde_json::to_string_pretty(&self.chat_log) {
+            let _ = std::fs::write(&path, &json);
+        }
+    }
+
+    /// Append a message to the chat log and persist.
+    fn record_message(&mut self, peer: &str, text: &str, outgoing: bool, is_group: bool, group_name: Option<String>) {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.chat_log.push(MessageRecord {
+            peer: peer.to_string(),
+            text: text.to_string(),
+            timestamp: ts,
+            direction: if outgoing { MessageDirection::Outgoing } else { MessageDirection::Incoming },
+            is_group,
+            group_name,
+            edited: false,
+        });
+        self.save_chat_log();
     }
 
     /// Connect to the relay server and register.
@@ -266,6 +337,7 @@ impl TinTinClient {
             edited: false,
         });
         self.save_history();
+        self.record_message(recipient, plaintext, true, false, None);
         println!("✓ Sent to '{}' (✓)", recipient);
         Ok(())
     }
@@ -343,7 +415,14 @@ impl TinTinClient {
             msg.text = new_text.to_string();
             msg.edited = true;
         }
+        // Mark the matching outgoing entry in chat log as edited.
+        if let Some(record) = self.chat_log.iter_mut().rev().find(|r| {
+            matches!(r.direction, MessageDirection::Outgoing)
+        }) {
+            record.edited = true;
+        }
         self.save_history();
+        self.save_chat_log();
         println!("✏️ Message #{} edited", index);
         Ok(())
     }
@@ -450,6 +529,7 @@ impl TinTinClient {
                         Ok(plaintext) => {
                             self.sessions.add(new_session);
                             Self::display_decrypted(&envelope.sender_id, &plaintext);
+                            self.record_decrypted(&envelope.sender_id, &plaintext);
                             // Send a read receipt back to the sender.
                             self.send_receipt(
                                 &envelope.sender_id,
@@ -473,6 +553,8 @@ impl TinTinClient {
                     if envelope.sender_id == self.user_id {
                         let text = String::from_utf8_lossy(&envelope.content);
                         println!("📝 Saved: {}", text);
+                        let my_id = self.user_id.clone();
+                        self.record_message(&my_id, &text, false, false, None);
                         continue;
                     }
 
@@ -487,6 +569,7 @@ impl TinTinClient {
                         match session.decrypt(&session_msg) {
                             Ok(plaintext) => {
                                 Self::display_decrypted(&envelope.sender_id, &plaintext);
+                                self.record_decrypted(&envelope.sender_id, &plaintext);
                                 // Send a read receipt back to the sender.
                                 self.send_receipt(
                                     &envelope.sender_id,
@@ -836,6 +919,7 @@ impl TinTinClient {
             edited: false,
         });
         self.save_history();
+        self.record_message(&group_name, plaintext, true, true, Some(group_name.clone()));
         println!("✓ Sent to group '{}' ({} members)", group_name, others.len());
         Ok(())
     }
@@ -864,6 +948,22 @@ impl TinTinClient {
         // Regular message.
         let text = String::from_utf8_lossy(plaintext);
         println!("💬 {}: {}", sender, text);
+    }
+
+    /// Record a decrypted message in the chat log.
+    fn record_decrypted(&mut self, sender: &str, plaintext: &[u8]) {
+        let (text, is_group, group_name) = if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(plaintext) {
+            if payload.get("__tintin_type").and_then(|v| v.as_str()) == Some("group") {
+                let t = payload["text"].as_str().unwrap_or("").to_string();
+                let gn = payload["group_name"].as_str().unwrap_or("Group").to_string();
+                (t, true, Some(gn))
+            } else {
+                (String::from_utf8_lossy(plaintext).to_string(), false, None)
+            }
+        } else {
+            (String::from_utf8_lossy(plaintext).to_string(), false, None)
+        };
+        self.record_message(sender, &text, false, is_group, group_name);
     }
 
     /// Receive a raw JSON value from the server.
@@ -914,6 +1014,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  /group leave id     — Leave a group");
     println!("  /group send id text — Send to a group");
     println!("  /edit <idx> text    — Edit a sent message (see /status for index)");
+    println!("  /search <text>       — Search message history");
     println!("  /status             — Show sent message status (✓/✓✓)");
     println!("  /help               — Show this help");
     println!("  /quit               — Exit");
@@ -952,6 +1053,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  /group leave id     — Leave a group");
             println!("  /group send id text — Send to a group");
             println!("  /edit <idx> text    — Edit a sent message");
+            println!("  /search <text>       — Search message history");
             println!("  /status             — Show sent message status (✓/✓✓)");
             println!("  /help               — Show this help");
             println!("  /quit               — Exit");
@@ -997,6 +1099,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(e) => eprintln!("Error: {e}"),
+            }
+            continue;
+        }
+
+        if let Some(query) = input.strip_prefix("/search ") {
+            let query = query.trim();
+            if query.is_empty() {
+                eprintln!("Usage: /search <text>");
+                continue;
+            }
+            let results: Vec<&MessageRecord> = client
+                .chat_log
+                .iter()
+                .filter(|r| r.text.to_lowercase().contains(&query.to_lowercase()))
+                .collect();
+            if results.is_empty() {
+                println!("No messages matching '{}'.", query);
+            } else {
+                println!("{} result(s) for '{}':", results.len(), query);
+                for (i, r) in results.iter().enumerate() {
+                    let prefix = match r.direction {
+                        MessageDirection::Outgoing => "→",
+                        MessageDirection::Incoming => "←",
+                    };
+                    let ctx = if r.is_group {
+                        format!("[{}] ", r.group_name.as_deref().unwrap_or("?"))
+                    } else {
+                        String::new()
+                    };
+                    let edited = if r.edited { " (edited)" } else { "" };
+                    println!("  {}) {}{} {}{}", i, ctx, prefix, r.peer, edited);
+                    println!("     {}", r.text);
+                }
             }
             continue;
         }
