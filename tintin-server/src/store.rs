@@ -74,7 +74,28 @@ impl Store {
             );
 
             CREATE INDEX IF NOT EXISTS idx_channel_subscribers_user
-                ON channel_subscribers(user_id);",
+                ON channel_subscribers(user_id);
+
+            CREATE TABLE IF NOT EXISTS polls (
+                poll_id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                creator         TEXT NOT NULL,
+                question        TEXT NOT NULL,
+                active          INTEGER NOT NULL DEFAULT 1,
+                created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS poll_options (
+                option_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                poll_id         INTEGER NOT NULL REFERENCES polls(poll_id),
+                option_text     TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS poll_votes (
+                poll_id         INTEGER NOT NULL REFERENCES polls(poll_id),
+                user_id         TEXT NOT NULL,
+                option_id       INTEGER NOT NULL,
+                PRIMARY KEY (poll_id, user_id)
+            );",
         )?;
 
         Ok(Store {
@@ -482,5 +503,154 @@ impl Store {
         }
 
         Ok(envelopes)
+    }
+
+    // ── Polls ─────────────────────────────────────────────────
+
+    /// Create a new poll with options. Returns the poll_id.
+    pub fn create_poll(
+        &self,
+        creator: &str,
+        question: &str,
+        options: &[String],
+    ) -> Result<i64, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO polls (creator, question) VALUES (?1, ?2)",
+            params![creator, question],
+        )?;
+        let poll_id = conn.last_insert_rowid();
+        for opt in options {
+            conn.execute(
+                "INSERT INTO poll_options (poll_id, option_text) VALUES (?1, ?2)",
+                params![poll_id, opt],
+            )?;
+        }
+        Ok(poll_id)
+    }
+
+    /// Record a vote (replaces previous vote if user already voted).
+    pub fn vote_poll(
+        &self,
+        poll_id: i64,
+        user_id: &str,
+        option_id: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let conn = self.conn.lock().unwrap();
+
+        // Check poll is active
+        let mut stmt = conn.prepare("SELECT active FROM polls WHERE poll_id = ?1")?;
+        let active: bool = stmt
+            .query_row(params![poll_id], |row| row.get::<_, i64>(0))
+            .map(|v| v != 0)
+            .unwrap_or(false);
+        if !active {
+            return Err("Poll is closed".into());
+        }
+
+        // Check option exists
+        let mut stmt = conn.prepare(
+            "SELECT COUNT(*) FROM poll_options WHERE option_id = ?1 AND poll_id = ?2",
+        )?;
+        let count: i64 = stmt.query_row(params![option_id, poll_id], |row| row.get(0))?;
+        if count == 0 {
+            return Err("Option not found".into());
+        }
+
+        // Upsert vote
+        conn.execute(
+            "INSERT OR REPLACE INTO poll_votes (poll_id, user_id, option_id) VALUES (?1, ?2, ?3)",
+            params![poll_id, user_id, option_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get poll results.
+    pub fn poll_results(&self, poll_id: i64) -> Result<Option<serde_json::Value>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+
+        // Get poll info
+        let mut stmt = conn.prepare(
+            "SELECT question, creator, active FROM polls WHERE poll_id = ?1",
+        )?;
+        let poll = stmt.query_row(params![poll_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        }).ok();
+
+        let (question, creator, active) = match poll {
+            Some(p) => p,
+            None => return Ok(None),
+        };
+
+        // Get options with vote counts
+        let mut stmt = conn.prepare(
+            "SELECT o.option_id, o.option_text, COUNT(v.user_id) as votes
+             FROM poll_options o
+             LEFT JOIN poll_votes v ON o.option_id = v.option_id
+             WHERE o.poll_id = ?1
+             GROUP BY o.option_id
+             ORDER BY o.option_id",
+        )?;
+        let options: Vec<serde_json::Value> = stmt
+            .query_map(params![poll_id], |row| {
+                Ok(serde_json::json!({
+                    "option_id": row.get::<_, i64>(0)?,
+                    "option_text": row.get::<_, String>(1)?,
+                    "votes": row.get::<_, i64>(2)?,
+                }))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(Some(serde_json::json!({
+            "poll_id": poll_id,
+            "question": question,
+            "creator": creator,
+            "active": active != 0,
+            "options": options,
+        })))
+    }
+
+    /// List all active polls.
+    pub fn list_active_polls(&self) -> Result<Vec<serde_json::Value>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT poll_id, question, creator FROM polls WHERE active = 1 ORDER BY created_at DESC",
+        )?;
+        let polls = stmt
+            .query_map([], |row| {
+                Ok(serde_json::json!({
+                    "poll_id": row.get::<_, i64>(0)?,
+                    "question": row.get::<_, String>(1)?,
+                    "creator": row.get::<_, String>(2)?,
+                }))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(polls)
+    }
+
+    /// Close a poll (creator only).
+    pub fn close_poll(&self, poll_id: i64, user_id: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT creator FROM polls WHERE poll_id = ?1")?;
+        let creator: Option<String> = stmt
+            .query_row(params![poll_id], |row| row.get(0))
+            .ok();
+        match creator {
+            Some(c) if c == user_id => {
+                conn.execute(
+                    "UPDATE polls SET active = 0 WHERE poll_id = ?1",
+                    params![poll_id],
+                )?;
+                Ok(true)
+            }
+            Some(_) => Ok(false), // not the creator
+            None => Ok(false),    // not found
+        }
     }
 }

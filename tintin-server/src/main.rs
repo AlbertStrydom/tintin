@@ -224,6 +224,41 @@ struct ChannelMembersCmd {
     channel_id: i64,
 }
 
+// ── Poll commands ───────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct CreatePollCmd {
+    cmd: String,
+    creator: String,
+    question: String,
+    options: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct VotePollCmd {
+    cmd: String,
+    poll_id: i64,
+    user_id: String,
+    option_id: i64,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct PollByIdCmd {
+    cmd: String,
+    poll_id: i64,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct ClosePollCmd {
+    cmd: String,
+    poll_id: i64,
+    user_id: String,
+}
+
 async fn handle_command(line: &str, state: &AppState) -> ServerResponse {
     let value: serde_json::Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -267,6 +302,11 @@ async fn handle_command(line: &str, state: &AppState) -> ServerResponse {
         "list_channels" => handle_list_channels(&value, state).await,
         "my_channels" => handle_my_channels(&value, state).await,
         "channel_members" => handle_channel_members(&value, state).await,
+        "create_poll" => handle_create_poll(&value, state).await,
+        "vote_poll" => handle_vote_poll(&value, state).await,
+        "poll_results" => handle_poll_results(&value, state).await,
+        "list_polls" => handle_list_polls(&value, state).await,
+        "close_poll" => handle_close_poll(&value, state).await,
         _ => ServerResponse {
             status: "error".to_string(),
             data: None,
@@ -812,6 +852,153 @@ async fn handle_channel_members(value: &serde_json::Value, state: &AppState) -> 
                 error: None,
             }
         }
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+// ── Poll handlers ─────────────────────────────────────────────
+
+async fn handle_create_poll(value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    let cmd: CreatePollCmd = match serde_json::from_value(value.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return ServerResponse {
+                status: "error".to_string(),
+                data: None,
+                error: Some(format!("Invalid payload: {e}")),
+            }
+        }
+    };
+    if cmd.options.len() < 2 {
+        return ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some("Poll must have at least 2 options".to_string()),
+        };
+    }
+    match state.store.create_poll(&cmd.creator, &cmd.question, &cmd.options) {
+        Ok(poll_id) => {
+            eprintln!("  📊 Poll '{}' created (id={})", cmd.question, poll_id);
+            ServerResponse {
+                status: "ok".to_string(),
+                data: Some(serde_json::json!({"poll_id": poll_id})),
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+async fn handle_vote_poll(value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    let cmd: VotePollCmd = match serde_json::from_value(value.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return ServerResponse {
+                status: "error".to_string(),
+                data: None,
+                error: Some(format!("Invalid payload: {e}")),
+            }
+        }
+    };
+    match state.store.vote_poll(cmd.poll_id, &cmd.user_id, cmd.option_id) {
+        Ok(()) => {
+            eprintln!("  🗳️ {} voted on poll {}", cmd.user_id, cmd.poll_id);
+            ServerResponse {
+                status: "ok".to_string(),
+                data: None,
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Vote error: {e}")),
+        },
+    }
+}
+
+async fn handle_poll_results(value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    let cmd: PollByIdCmd = match serde_json::from_value(value.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return ServerResponse {
+                status: "error".to_string(),
+                data: None,
+                error: Some(format!("Invalid payload: {e}")),
+            }
+        }
+    };
+    match state.store.poll_results(cmd.poll_id) {
+        Ok(Some(results)) => {
+            ServerResponse {
+                status: "ok".to_string(),
+                data: Some(results),
+                error: None,
+            }
+        }
+        Ok(None) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Poll '{}' not found", cmd.poll_id)),
+        },
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+async fn handle_list_polls(_value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    match state.store.list_active_polls() {
+        Ok(polls) => {
+            ServerResponse {
+                status: "ok".to_string(),
+                data: Some(serde_json::json!({"polls": polls})),
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+async fn handle_close_poll(value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    let cmd: ClosePollCmd = match serde_json::from_value(value.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return ServerResponse {
+                status: "error".to_string(),
+                data: None,
+                error: Some(format!("Invalid payload: {e}")),
+            }
+        }
+    };
+    match state.store.close_poll(cmd.poll_id, &cmd.user_id) {
+        Ok(true) => {
+            eprintln!("  🔒 Poll {} closed by {}", cmd.poll_id, cmd.user_id);
+            ServerResponse {
+                status: "ok".to_string(),
+                data: None,
+                error: None,
+            }
+        }
+        Ok(false) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some("Poll not found or you are not the creator".to_string()),
+        },
         Err(e) => ServerResponse {
             status: "error".to_string(),
             data: None,

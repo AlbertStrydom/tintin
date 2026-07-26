@@ -1188,6 +1188,107 @@ impl TinTinClient {
         Ok(())
     }
 
+    // ── Poll methods ─────────────────────────────────────────
+
+    /// Create a poll on the server and notify a recipient.
+    async fn create_poll(
+        &mut self,
+        question: &str,
+        options: &[String],
+        notify_recipient: Option<&str>,
+    ) -> Result<i64, Box<dyn std::error::Error>> {
+        // Create on server
+        let request = serde_json::json!({
+            "cmd": "create_poll",
+            "creator": self.user_id,
+            "question": question,
+            "options": options,
+        });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed to create poll: {}", resp["error"]).into());
+        }
+        let poll_id = resp["data"]["poll_id"].as_i64().unwrap_or(0);
+
+        // Send notification to recipient if specified
+        if let Some(recipient) = notify_recipient {
+            let payload = serde_json::json!({
+                "__tintin_type": "poll",
+                "poll_id": poll_id,
+                "question": question,
+                "options": options,
+            });
+            let text = serde_json::to_string(&payload)?;
+            self.send_message(recipient, &text).await?;
+        }
+
+        println!("📊 Poll created (id: {})", poll_id);
+        Ok(poll_id)
+    }
+
+    /// Vote on a poll.
+    async fn vote_poll(
+        &self,
+        poll_id: i64,
+        option_id: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let request = serde_json::json!({
+            "cmd": "vote_poll",
+            "poll_id": poll_id,
+            "user_id": self.user_id,
+            "option_id": option_id,
+        });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Vote failed: {}", resp["error"]).into());
+        }
+        println!("🗳️  Voted on poll {} (option {})", poll_id, option_id);
+        Ok(())
+    }
+
+    /// Get poll results.
+    async fn poll_results(&self, poll_id: i64) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let request = serde_json::json!({
+            "cmd": "poll_results",
+            "poll_id": poll_id,
+        });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed: {}", resp["error"]).into());
+        }
+        Ok(resp["data"].clone())
+    }
+
+    /// List active polls.
+    async fn list_polls(&self) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        let request = serde_json::json!({ "cmd": "list_polls" });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed: {}", resp["error"]).into());
+        }
+        Ok(resp["data"]["polls"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// Close a poll (creator only).
+    async fn close_poll(&self, poll_id: i64) -> Result<(), Box<dyn std::error::Error>> {
+        let request = serde_json::json!({
+            "cmd": "close_poll",
+            "poll_id": poll_id,
+            "user_id": self.user_id,
+        });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed to close poll: {}", resp["error"]).into());
+        }
+        println!("🔒 Poll {} closed", poll_id);
+        Ok(())
+    }
+
     /// Display decrypted message content, detecting group-tagged payloads.
     fn display_decrypted(sender: &str, plaintext: &[u8]) {
         // Check for TinTin structured message (group chat, etc.)
@@ -1204,6 +1305,20 @@ impl TinTinClient {
                     let cname = payload["channel_name"].as_str().unwrap_or("Channel");
                     let text = payload["text"].as_str().unwrap_or("");
                     println!("📢 [{}] {}: {}", cname, sender, text);
+                    return;
+                }
+                "poll" => {
+                    let question = payload["question"].as_str().unwrap_or("Poll");
+                    println!("📊 Poll from {}: \"{}\"", sender, question);
+                    if let Some(opts) = payload["options"].as_array() {
+                        for (i, opt) in opts.iter().enumerate() {
+                            let text = opt.as_str().unwrap_or("");
+                            println!("      {}. {}", i + 1, text);
+                        }
+                    }
+                    if let Some(pid) = payload["poll_id"].as_i64() {
+                        println!("      Vote with: /poll vote {} <number>", pid);
+                    }
                     return;
                 }
                 "edit" => {
@@ -1231,6 +1346,9 @@ impl TinTinClient {
                 let t = payload["text"].as_str().unwrap_or("").to_string();
                 let cn = payload["channel_name"].as_str().unwrap_or("Channel").to_string();
                 (t, false, None, true, Some(cn))
+            } else if payload.get("__tintin_type").and_then(|v| v.as_str()) == Some("poll") {
+                let question = payload["question"].as_str().unwrap_or("Poll").to_string();
+                (format!("[Poll] {}", question), false, None, false, None)
             } else {
                 (String::from_utf8_lossy(plaintext).to_string(), false, None, false, None)
             }
@@ -1542,6 +1660,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  /channel send <id> <t>  — Send to a channel (owner only)");
     println!("  /channels              — List all available channels");
     println!("  /my_channels           — List your channel subscriptions");
+    println!("  /poll create <q>|<o1>|<o2>|... — Create a poll (pipe-separated)");
+    println!("  /poll vote <id> <n>             — Vote on a poll");
+    println!("  /poll results <id>              — View poll results");
+    println!("  /poll close <id>                — Close a poll (creator only)");
+    println!("  /polls                          — List active polls");
     println!("  /story <text>        — Post a status story (24h expiry)");
     println!("  /stories             — View friends' active stories");
     println!("  /clearstory          — Remove your story");
@@ -1591,6 +1714,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  /channel send <id> <t>  — Send to a channel (owner only)");
             println!("  /channels              — List all available channels");
             println!("  /my_channels           — List your channel subscriptions");
+            println!("  /poll create <q>|<o1>|<o2>|... — Create a poll (pipe-separated)");
+            println!("  /poll vote <id> <n>             — Vote on a poll");
+            println!("  /poll results <id>              — View poll results");
+            println!("  /poll close <id>                — Close a poll (creator only)");
+            println!("  /polls                          — List active polls");
             println!("  /story <text>        — Post a status story (24h expiry)");
             println!("  /stories             — View friends' active stories");
             println!("  /clearstory          — Remove your story");
@@ -1923,6 +2051,104 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("My channels:");
                         for ch in &chs {
                             println!("  {} — {} (owner: {})", ch["channel_id"], ch["name"], ch["owner_id"]);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Error: {e}"),
+            }
+            continue;
+        }
+
+        if let Some(rest) = input.strip_prefix("/poll ") {
+            let parts: Vec<&str> = rest.splitn(4, ' ').collect();
+            if parts.is_empty() {
+                eprintln!("Usage:");
+                eprintln!("  /poll create <question>|<opt1>|<opt2>|...  — Create poll");
+                eprintln!("  /poll vote <poll_id> <opt_no>            — Vote");
+                eprintln!("  /poll results <poll_id>                  — Show results");
+                eprintln!("  /poll close <poll_id>                    — Close (creator only)");
+                eprintln!("  /polls                                   — List active polls");
+                continue;
+            }
+            let subcmd = parts[0];
+            match subcmd {
+                "create" => {
+                    if parts.len() < 2 {
+                        eprintln!("Usage: /poll create <question>|<opt1>|<opt2>|...");
+                        continue;
+                    }
+                    let args: Vec<&str> = parts[1].split('|').collect();
+                    if args.len() < 3 {
+                        eprintln!("Need at least: question|opt1|opt2");
+                        continue;
+                    }
+                    let question = args[0];
+                    let options: Vec<String> = args[1..].iter().map(|s| s.to_string()).collect();
+                    match client.create_poll(question, &options, None).await {
+                        Ok(id) => println!("✓ Poll created (id: {})", id),
+                        Err(e) => eprintln!("Error: {e}"),
+                    }
+                }
+                "vote" => {
+                    if parts.len() < 3 {
+                        eprintln!("Usage: /poll vote <poll_id> <option_number>");
+                        continue;
+                    }
+                    let pid: i64 = match parts[1].parse() { Ok(v) => v, Err(_) => { eprintln!("Invalid poll id"); continue; } };
+                    let opt: i64 = match parts[2].parse() { Ok(v) => v, Err(_) => { eprintln!("Invalid option number"); continue; } };
+                    match client.vote_poll(pid, opt).await {
+                        Ok(()) => {}
+                        Err(e) => eprintln!("Error: {e}"),
+                    }
+                }
+                "results" => {
+                    if parts.len() < 2 {
+                        eprintln!("Usage: /poll results <poll_id>");
+                        continue;
+                    }
+                    let pid: i64 = match parts[1].parse() { Ok(v) => v, Err(_) => { eprintln!("Invalid poll id"); continue; } };
+                    match client.poll_results(pid).await {
+                        Ok(data) => {
+                            println!("📊 Poll: {}", data["question"]);
+                            if let Some(opts) = data["options"].as_array() {
+                                for opt in opts {
+                                    let txt = opt["option_text"].as_str().unwrap_or("");
+                                    let votes = opt["votes"].as_i64().unwrap_or(0);
+                                    println!("  {} - {} vote(s)", txt, votes);
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("Error: {e}"),
+                    }
+                }
+                "close" => {
+                    if parts.len() < 2 {
+                        eprintln!("Usage: /poll close <poll_id>");
+                        continue;
+                    }
+                    let pid: i64 = match parts[1].parse() { Ok(v) => v, Err(_) => { eprintln!("Invalid poll id"); continue; } };
+                    match client.close_poll(pid).await {
+                        Ok(()) => {}
+                        Err(e) => eprintln!("Error: {e}"),
+                    }
+                }
+                _ => {
+                    eprintln!("Unknown poll command: {subcmd}");
+                    eprintln!("Available: create, vote, results, close");
+                }
+            }
+            continue;
+        }
+
+        if input == "/polls" {
+            match client.list_polls().await {
+                Ok(polls) => {
+                    if polls.is_empty() {
+                        println!("No active polls.");
+                    } else {
+                        println!("Active polls:");
+                        for p in &polls {
+                            println!("  {} — \"{}\" (by {})", p["poll_id"], p["question"], p["creator"]);
                         }
                     }
                 }
