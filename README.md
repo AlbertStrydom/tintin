@@ -1,273 +1,161 @@
-# TinTin — Secure E2E Encrypted Messaging
+# TinTin — Secure E2E Encrypted Super App
 
 **Designed by A.Strydom**
 
-A secure, open-source messaging app that combines the best of WhatsApp, Telegram, and WeChat — with end-to-end encryption by default.
+A secure, open-source messaging super app combining the best of WhatsApp, Telegram, and WeChat — with end-to-end encryption by default. Feature-complete prototype with 30+ CLI commands.
 
-## Phase 1 — Rust Foundations ✓
+## Quick Start
 
-The core Rust library, relay server, and CLI chat client with E2E encryption.
+```bash
+# Terminal 1 — Server
+cargo run --bin tintin-server
 
-### Architecture
+# Terminal 2 — Alice
+cargo run --bin tintin-cli
+
+# Terminal 3 — Bob
+cargo run --bin tintin-cli
+```
+
+Or with Docker:
+
+```bash
+docker compose up --build
+```
+
+## Features (31 CLI Commands)
+
+| # | Feature | CLI Command | Details |
+|---|---------|-------------|---------|
+| 1 | **E2E Messaging** | `/msg <user> <text>` | X25519 + Double Ratchet + ChaCha20-Poly1305 |
+| 2 | **Read Receipts** | `/status` | ✓ delivery + ✓✓ read tracking |
+| 3 | **Saved Messages** | Self-messages | Bypasses encryption, auto-saved |
+| 4 | **Contact Discovery** | `/users` | Lists all registered users |
+| 5 | **Group Chats** | `/group create/join/leave/send` | Pairwise E2E per member |
+| 6 | **Edit Messages** | `/edit <idx> <text>` | Shows ✏️ edited marker |
+| 7 | **Message Search** | `/search <text>` | Persistent local chat log |
+| 8 | **Status / Stories** | `/story /stories /clearstory` | 24-hour auto-expiry |
+| 9 | **File Sharing** | `/sendfile <user> <path>` | 256KB chunked E2E transfer |
+| 10 | **Channels** | `/channel create/sub/unsub/send` | Broadcast channels, E2E |
+| 11 | **Polls** | `/poll create/vote/results/close` | Server-side tally |
+| 12 | **P2P Calls** | `/call /accept /end` | Encrypted signalling, X25519 media key |
+| 13 | **Stickers** | `/sticker <user> <pack> <id>` | 4 emoji packs (wave/face/heart/mood) |
+| 14 | **Timeline / Moments** | `/moment /timeline /comment` | Social feed with wall posting |
+| 15 | **QR Contact Sharing** | `/qr /scan` | ASCII QR + `tintin://` URIs |
+| 16 | **Voice Messages** | `/voice <user> <path>` | Audio files, E2E encrypted |
+| 17 | **Mini-app SDK** | `tintin-sdk` crate (MIT) | Sandboxed WebView mini-apps |
+
+All messages are end-to-end encrypted by default — the server never sees plaintext.
+
+## Project Structure (8 crates)
 
 ```
 tintin/
-├── tintin-core/      # Shared Rust library: crypto, keys, Double Ratchet
-├── tintin-ffi/       # C-compatible FFI layer for iOS/Android clients
-├── tintin-server/    # Minimal relay server (store-and-forward)
-├── tintin-cli/       # Terminal chat client
-├── tintin-ios/       # iOS SwiftUI app (Phase 2)
-└── Cargo.toml        # Workspace definition
+├── tintin-core/        # Rust crypto (X25519, Double Ratchet, ChaCha20-Poly1305)
+├── tintin-server/      # TCP relay server (port 9666, SQLite persistence)
+├── tintin-cli/         # Terminal client (31 commands, all features)
+├── tintin-ffi/         # C FFI for iOS
+├── tintin-ios/         # SwiftUI iOS app source
+├── tintin-jni/         # JNI for Android
+├── tintin-android/     # Jetpack Compose Android app source
+├── tintin-sdk/         # Mini-app SDK crate (MIT license)
+├── Dockerfile          # Production server container
+├── docker-compose.yml  # One-command server deployment
+├── TINTIN_CONCEPT.md   # Full 10-section project specification
+└── TINTIN_MINIAPPS.md  # Mini-app SDK specification
 ```
 
-### Status
+## Architecture
 
-| Component | Status |
-|---|---|
-| **E2E Encryption** | ✅ ChaCha20-Poly1305 AEAD |
-| **Key Exchange** | ✅ X25519 Diffie-Hellman |
-| **Double Ratchet** | ✅ Send/receive chains, DH ratchet steps |
-| **Session Management** | ✅ Session creation, in-memory store |
-| **Relay Server** | ✅ TCP with JSON protocol, key store, message queue |
-| **CLI Client** | ✅ Register, send, receive encrypted messages |
-| **C FFI Layer** | ✅ Identity, signed pre-key, session encrypt/decrypt via C |
-| **iOS SwiftUI App** | ✅ All source files + XcodeGen project spec |
-| **Tests** | ✅ 17 passing (core crypto + server relay + FFI) |
+- **Client-server**: TCP relay with line-delimited JSON on port 9666
+- **Encryption**: Signal Protocol — X25519 key exchange, Double Ratchet, ChaCha20-Poly1305 AEAD
+- **Persistence**: SQLite via `rusqlite` (server) + JSON files (CLI)
+- **Groups & Channels**: Pairwise E2E (one encrypted copy per member/subscriber)
+- **File/Voice Transfer**: Client-side 256KB base64 chunks, each E2E encrypted
+- **Server tables**: `users`, `messages`, `groups`, `group_members`, `statuses`, `channels`, `channel_subscribers`, `polls`, `poll_options`, `poll_votes`, `timeline_posts`, `timeline_comments`
 
-## How to Run
+## Configuration
 
-### 1. Start the Relay Server
+| Env Variable | Default | Description |
+|---|---|---|
+| `TINTIN_DB_PATH` | `tintin-server.db` | Server database path |
 
-Open **Terminal 1**:
+## Tests
 
 ```bash
-cd tintin
-cargo run --bin tintin-server
-```
-
-You'll see:
-```
-🚀 TinTin Relay Server listening on 127.0.0.1:9666
-```
-
-### 2. Start Alice (Terminal 2)
-
-Open **Terminal 2**:
-
-```bash
-cd tintin
-cargo run --bin tintin-cli
-```
-
-Enter your user ID when prompted: `alice`
-
-### 3. Start Bob (Terminal 3)
-
-Open **Terminal 3**:
-
-```bash
-cd tintin
-cargo run --bin tintin-cli
-```
-
-Enter your user ID when prompted: `bob`
-
-### 4. Send your first E2E message
-
-In Alice's terminal:
-```
-> /msg bob Hello Bob! This message is end-to-end encrypted.
-```
-
-In Bob's terminal:
-```
-> /recv
-📬 1 new message(s):
-💬 alice: Hello Bob! This message is end-to-end encrypted.
-```
-
-Bob can reply:
-```
-> /msg alice Hey Alice! Got your encrypted message loud and clear.
-```
-
-Alice checks:
-```
-> /recv
-📬 1 new message(s):
-💬 bob: Hey Alice! Got your encrypted message loud and clear.
-```
-
-### Available CLI Commands
-
-| Command | Description |
-|---|---|
-| `/msg <user> <text>` | Send an E2E encrypted message |
-| `/recv` | Poll for new messages |
-| `/help` | Show help |
-| `/quit` | Exit |
-
-## How It Works
-
-1. **Registration**: Each client generates an X25519 identity key pair and a signed pre-key, then registers the public keys with the relay server.
-
-2. **Session Establishment**: When Alice messages Bob for the first time, she fetches his pre-key bundle, generates an ephemeral key, and computes a shared secret via X25519 Diffie-Hellman. This initializes the Double Ratchet.
-
-3. **Encryption**: Each message is encrypted with ChaCha20-Poly1305 using a key derived from the Double Ratchet's sending chain. A new message key is derived for every message (forward secrecy).
-
-4. **Relay**: The server stores and forwards encrypted envelopes. It never sees plaintext — only ciphertext, routing info, and metadata.
-
-5. **Decryption**: The recipient uses their session's receiving chain (which advanced in sync with the sender's chain) to derive the correct message key and decrypt.
-
-## Run Tests
-
-```bash
-cd tintin
 cargo test --workspace
 ```
 
-## Phase 2 — iOS App (SwiftUI + Rust FFI) 🏗️
+**37 tests pass** — 13 core crypto + 11 server + 2 FFI + 2 JNI + 9 SDK. Zero warnings.
 
-The `tintin-ios/` directory contains a complete SwiftUI client that calls into Rust through a C FFI bridge.
+## CLI Commands Reference
 
-### How to Build on Mac
+```
+/msg <user> <text>        Send E2E encrypted message
+/recv                     Poll for new messages
+/group create/join/...    Group chat management
+/channel create/sub/...   Broadcast channels
+/poll create/vote/...     Polls with tally
+/call /accept /end        Encrypted P2P call signalling
+/sticker <user> <p> <id>  Send emoji sticker
+/sendfile <user> <path>   Send file (E2E chunked)
+/voice <user> <path>      Send voice message
+/moment <text>            Post to your timeline
+/moment <u> <t>           Post on someone's wall
+/timeline                 View social feed
+/comment <id> <text>      Comment on a timeline post
+/postcomments <id>        View comments
+/deletepost <id>          Delete your post
+/search <text>            Search message history
+/edit <idx> <text>        Edit sent message
+/status                   Show message delivery status
+/story <text>             Post status (24h)
+/stories                  View contacts' stories
+/clearstory               Clear your story
+/qr                       Show your contact QR code
+/scan <uri>               Scan a contact QR URI
+/users                    List registered users
+/mygroups                 List your groups
+/my_channels              List subscribed channels
+/channels                 List all channels
+/polls                    List active polls
+/help                     Show this help
+/quit                     Exit
+/save                     Save session
+```
 
-You need a Mac with Xcode 15+, Rust, and the iOS Rust targets installed:
+## How to Build
+
+### Server (any platform)
 
 ```bash
-# 1. Install dependencies
-brew install xcodegen
-rustup target add aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
-
-# 2. Build the Rust library for all iOS targets
-cd tintin-ios
-./build_rust.sh
-
-# 3. Generate the Xcode project
-xcodegen generate
-
-# 4. Open TinTin.xcodeproj, set your team in Signing & Capabilities, and run
+cargo build --release -p tintin-server
 ```
 
-### iOS App Architecture
-
-```
-tintin-ios/
-├── project.yml              # XcodeGen project spec
-├── build_rust.sh            # Cross-compiles Rust for iOS
-├── TinTin/
-│   ├── TinTinApp.swift       # @main entry — navigation flow
-│   ├── Info.plist
-│   ├── Models/               # Swift data types
-│   │   ├── ServerConfig.swift
-│   │   ├── UserModel.swift
-│   │   └── MessageModel.swift
-│   ├── Services/             # Business logic
-│   │   ├── RustCoreService.swift   # Safe Swift wrapper around C FFI
-│   │   └── RelayService.swift      # TCP relay client (NWConnection)
-│   ├── Views/                # SwiftUI screens
-│   │   ├── ConnectView.swift
-│   │   ├── RegisterView.swift
-│   │   ├── ChatListView.swift
-│   │   └── ChatView.swift
-│   └── Bridge/               # C bridging header + Rust lib
-│       ├── tintin_core.h
-│       └── TinTin-Bridging-Header.h
-```
-
-### App Flow
-
-1. **Connect** — enter server host/port and your user ID
-2. **Register** — generates identity keys, uploads public key bundle to relay
-3. **Chat List** — shows contacts; tap "+" to start a new encrypted conversation (fetches remote keys, creates Double Ratchet session)
-4. **Chat** — messages are encrypted in Rust, sent as JSON via TCP, decrypted on the receiving side
-
-### Current Limitations (Phase 2)
-
-- Polling-based message receive (3s interval) — push notifications come later
-- Pre-key bundle messages not fully implemented on the responder side
-- No message persistence (sessions stored in UserDefaults)
-- Single device (device_id always 1)
-
-## Phase 3 — Android App (Jetpack Compose + JNI + Rust Core) 🏗️
-
-The `tintin-android/` directory contains a complete Jetpack Compose client that calls into Rust through JNI. The architecture mirrors the iOS app closely.
-
-### How to Build
-
-You need Android Studio, the Android NDK, and the Rust Android targets installed:
+### iOS (needs Mac)
 
 ```bash
-# 1. Install Rust Android targets and cargo-ndk
-rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android
+rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+cd tintin-ios && ./build_rust.sh && xcodegen generate
+```
+
+### Android (needs NDK)
+
+```bash
+rustup target add aarch64-linux-android armv7-linux-androideabi
 cargo install cargo-ndk
-
-# 2. Set your NDK path (adjust for your system)
-export ANDROID_NDK_HOME=$HOME/Android/Sdk/ndk/25.2.9519653
-
-# 3. Build the Rust library for all Android ABIs
-cd tintin-android
-./build_rust.sh
-
-# 4. Open tintin-android/ in Android Studio
-#    Let Gradle sync, then run on device or emulator (min API 26)
+cd tintin-android && ./build_rust.sh
 ```
 
-### Android App Architecture
+## Docker
 
-```
-tintin-android/
-├── build.gradle.kts           # Root Gradle config
-├── settings.gradle.kts
-├── gradle.properties
-├── build_rust.sh              # Cross-compiles Rust for Android
-├── app/
-│   ├── build.gradle.kts       # App module with Compose deps
-│   └── src/main/
-│       ├── AndroidManifest.xml
-│       ├── res/               # Resources (strings, colors, theme)
-│       └── java/com/tintin/app/
-│           ├── RustBridge.kt           # JNI external declarations
-│           ├── MainActivity.kt         # Composable navigation host
-│           ├── models/
-│           │   ├── ServerConfig.kt
-│           │   ├── UserModel.kt
-│           │   └── MessageModel.kt
-│           ├── services/
-│           │   ├── RelayService.kt     # TCP relay client
-│           │   └── SessionManager.kt   # Crypto handle management
-│           └── ui/
-│               ├── theme/Theme.kt
-│               ├── ConnectScreen.kt
-│               ├── RegisterScreen.kt
-│               ├── ChatListScreen.kt
-│               └── ChatScreen.kt
+```bash
+docker compose up --build
 ```
 
-### App Flow
-
-Same as iOS: **Connect** → **Register** → **Chat List** → **Chat**
-
-### Rust JNI Crate
-
-`tintin-jni/` mirrors `tintin-ffi/` but exposes functions through JNI instead of C:
-
-| Rust function | JNI name |
-|---|---|
-| `identityGenerate` | `Java_com_tintin_app_RustBridge_identityGenerate` |
-| `sessionNewInitiator` | `Java_com_tintin_app_RustBridge_sessionNewInitiator` |
-| `sessionEncrypt` | `Java_com_tintin_app_RustBridge_sessionEncrypt` |
-| ... | ... |
-
-All handles are `jlong` (pointer widths). Tested with 17 + 2 = 19 total passing tests.
-
-## Roadmap
-
-- **Phase 2**: ✅ iOS SwiftUI app (source complete, needs Mac build)
-- **Phase 3**: ✅ Android Jetpack Compose app (source complete, needs NDK build) 🏗️
-- **Phase 4**: Group chats, voice messages, calls
-- **Phase 5**: Channels, stickers, mini-apps
+Starts the relay server on port 9666 with persistent SQLite storage in a Docker volume.
 
 ## License
 
-AGPL v3 (clients + server)
+- **Clients + Server**: AGPL v3 (see [LICENSE](LICENSE))
+- **Mini-app SDK** (`tintin-sdk/`): MIT — to encourage third-party adoption
