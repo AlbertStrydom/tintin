@@ -1804,15 +1804,16 @@ impl TinTinClient {
         Ok(resp["data"]["stories"].as_array().cloned().unwrap_or_default())
     }
 
-    // ── File Sharing / Voice Messages ──────────────────────────
+    // ── File Sharing / Voice Messages / HD Photos ─────────────
 
     /// Send a file to another user (chunked, E2E encrypted).
     async fn send_file(
         &mut self,
         recipient: &str,
         file_path: &str,
+        is_hd: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.send_file_inner(recipient, file_path, "file").await
+        self.send_file_inner(recipient, file_path, "file", is_hd).await
     }
 
     /// Send a voice message (audio file, marked as voice).
@@ -1821,15 +1822,16 @@ impl TinTinClient {
         recipient: &str,
         file_path: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.send_file_inner(recipient, file_path, "voice").await
+        self.send_file_inner(recipient, file_path, "voice", true).await
     }
 
-    /// Core: send a file (or voice) in chunks.
+    /// Core: send a file (or voice) in chunks, optionally compressing images.
     async fn send_file_inner(
         &mut self,
         recipient: &str,
         file_path: &str,
         msg_type: &str,
+        is_hd: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let path = std::path::Path::new(file_path);
         let file_name = path
@@ -1837,7 +1839,42 @@ impl TinTinClient {
             .and_then(|n| n.to_str())
             .unwrap_or("unknown")
             .to_string();
-        let file_data = std::fs::read(file_path)?;
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        let is_image = matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp");
+
+        let mut file_data = std::fs::read(file_path)?;
+        let original_size = file_data.len() as u64;
+        let mut thumbnail_b64 = String::new();
+
+        // Compress images unless HD flag is set
+        if is_image && !is_hd && msg_type != "voice" {
+            if let Ok(img) = image::load_from_memory(&file_data) {
+                let (w, h) = (img.width(), img.height());
+                // Scale down if larger than 2048px on longest edge
+                let max_dim = 2048u32;
+                let img = if w > max_dim || h > max_dim {
+                    let ratio = max_dim as f64 / w.max(h) as f64;
+                    let nw = (w as f64 * ratio) as u32;
+                    let nh = (h as f64 * ratio) as u32;
+                    img.resize(nw, nh, image::imageops::FilterType::Lanczos3)
+                } else {
+                    img
+                };
+                // Save as JPEG quality 85
+                let mut compressed = Vec::new();
+                img.write_to(&mut std::io::Cursor::new(&mut compressed), image::ImageFormat::Jpeg)?;
+                let compression_pct = if original_size > 0 { 100 - (compressed.len() as u64 * 100 / original_size) } else { 0 };
+                println!("  🖼️ Compressed {} ({}×{}) — {}% smaller", file_name, w, h, compression_pct);
+                file_data = compressed;
+
+                // Generate thumbnail (128px max)
+                let thumb = img.thumbnail(128, 128);
+                let mut thumb_data = Vec::new();
+                thumb.write_to(&mut std::io::Cursor::new(&mut thumb_data), image::ImageFormat::Jpeg)?;
+                thumbnail_b64 = crate::base64_encode(&thumb_data);
+            }
+        }
+
         let file_size = file_data.len() as u64;
 
         const CHUNK_SIZE: usize = 256 * 1024; // 256 KB per chunk
@@ -1864,7 +1901,7 @@ impl TinTinClient {
         );
 
         for (i, chunk) in file_data.chunks(CHUNK_SIZE).enumerate() {
-            let payload = serde_json::json!({
+            let mut payload = serde_json::json!({
                 "__tintin_type": msg_type,
                 "file_id": file_id,
                 "file_name": file_name,
@@ -1872,7 +1909,14 @@ impl TinTinClient {
                 "total_chunks": total_chunks,
                 "chunk_index": i,
                 "data": crate::base64_encode(chunk),
+                "is_image": is_image && !thumbnail_b64.is_empty(),
+                "original_width": if is_image { 0 } else { 0 },
+                "original_height": if is_image { 0 } else { 0 },
             });
+            // Add thumbnail to first chunk
+            if i == 0 && !thumbnail_b64.is_empty() {
+                payload["thumbnail"] = serde_json::Value::String(thumbnail_b64.clone());
+            }
             let payload_bytes = serde_json::to_vec(&payload)?;
 
             // Encrypt and send
@@ -1923,7 +1967,13 @@ impl TinTinClient {
         }
 
         // Track in sent messages.
-        let file_label = if msg_type == "voice" { format!("🎤 Voice ({})", file_name) } else { format!("📁 {} ({} KB)", file_name, file_size / 1024) };
+        let file_label = if is_image && !thumbnail_b64.is_empty() {
+            format!("🖼️ {} ({} KB, compressed)", file_name, file_size / 1024)
+        } else if msg_type == "voice" {
+            format!("🎤 Voice ({})", file_name)
+        } else {
+            format!("📁 {} ({} KB)", file_name, file_size / 1024)
+        };
         self.sent_messages.push(SentMessage {
             recipient: recipient.to_string(),
             text: file_label,
@@ -1956,7 +2006,8 @@ impl TinTinClient {
         }
 
         let is_voice = chunk_type == Some("voice");
-        let type_label = if is_voice { "🎤 Voice" } else { "📁" };
+        let is_image = payload.get("is_image").and_then(|v| v.as_bool()).unwrap_or(false);
+        let type_label = if is_image { "🖼️" } else if is_voice { "🎤" } else { "📁" };
 
         let file_id = payload["file_id"].as_str().unwrap_or("").to_string();
         let file_name = payload["file_name"].as_str().unwrap_or("unknown").to_string();
@@ -2006,7 +2057,7 @@ impl TinTinClient {
             } else {
                 println!(
                     "✅ {} '{}' saved ({} KB) → {}",
-                    if is_voice { "🎤 Voice" } else { "📁 File" },
+                    if is_image { "🖼️ Image" } else if is_voice { "🎤 Voice" } else { "📁 File" },
                     name,
                     size / 1024,
                     out_path.display()
@@ -2083,7 +2134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  /group send id text — Send to a group");
     println!("  /edit <idx> text    — Edit a sent message (see /status for index)");
     println!("  /search <text>       — Search message history");
-    println!("  /sendfile <user> <path> — Send a file (E2E encrypted, chunked)");
+    println!("  /sendfile <user> <path> [--hd] — Send a file (auto-compress images)");
     println!("  /channel create <name>  — Create a broadcast channel");
     println!("  /channel sub <id>       — Subscribe to a channel");
     println!("  /channel unsub <id>     — Unsubscribe from a channel");
@@ -2155,7 +2206,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  /group send id text — Send to a group");
             println!("  /edit <idx> text    — Edit a sent message");
             println!("  /search <text>       — Search message history");
-    println!("  /sendfile <user> <path> — Send a file (E2E encrypted, chunked)");
+    println!("  /sendfile <user> <path> [--hd] — Send a file (auto-compress images)");
     println!("  /voice <user> <path>    — Send a voice message (audio file)");
             println!("  /channel create <name>  — Create a broadcast channel");
             println!("  /channel sub <id>       — Subscribe to a channel");
@@ -2800,12 +2851,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if let Some(rest) = input.strip_prefix("/sendfile ") {
-            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+            let parts: Vec<&str> = rest.splitn(3, ' ').collect();
             if parts.len() < 2 {
-                eprintln!("Usage: /sendfile <user> <filepath>");
+                eprintln!("Usage: /sendfile <user> <filepath> [--hd]");
                 continue;
             }
-            if let Err(e) = client.send_file(parts[0], parts[1]).await {
+            let (user, filepath, is_hd) = if parts.len() >= 3 && parts[2] == "--hd" {
+                (parts[0], parts[1], true)
+            } else if parts.len() >= 2 {
+                (parts[0], parts[1], false)
+            } else {
+                eprintln!("Usage: /sendfile <user> <filepath> [--hd]");
+                continue;
+            };
+            if let Err(e) = client.send_file(user, filepath, is_hd).await {
                 eprintln!("Error: {e}");
             }
             continue;
