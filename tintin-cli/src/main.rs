@@ -54,6 +54,15 @@ struct MessageRecord {
     edited: bool,
 }
 
+/// A file being received (chunks accumulated before assembly).
+#[derive(Debug, Clone)]
+struct PendingFile {
+    file_name: String,
+    file_size: u64,
+    total_chunks: usize,
+    received_chunks: HashMap<usize, Vec<u8>>,
+}
+
 /// A group we belong to.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct GroupInfo {
@@ -83,6 +92,8 @@ struct TinTinClient {
     groups: HashMap<String, GroupInfo>,
     /// Full chat log for search.
     chat_log: Vec<MessageRecord>,
+    /// Incoming file transfers being assembled.
+    pending_files: HashMap<String, PendingFile>,
 }
 
 impl TinTinClient {
@@ -101,6 +112,7 @@ impl TinTinClient {
             sent_messages: Vec::new(),
             groups: HashMap::new(),
             chat_log: Vec::new(),
+            pending_files: HashMap::new(),
         };
         client.load_history();
         client.load_groups();
@@ -528,8 +540,10 @@ impl TinTinClient {
                     match new_session.decrypt(&prekey.session_message) {
                         Ok(plaintext) => {
                             self.sessions.add(new_session);
-                            Self::display_decrypted(&envelope.sender_id, &plaintext);
-                            self.record_decrypted(&envelope.sender_id, &plaintext);
+                            if !self.process_file_chunk(&envelope.sender_id, &plaintext) {
+                                Self::display_decrypted(&envelope.sender_id, &plaintext);
+                                self.record_decrypted(&envelope.sender_id, &plaintext);
+                            }
                             // Send a read receipt back to the sender.
                             self.send_receipt(
                                 &envelope.sender_id,
@@ -568,8 +582,10 @@ impl TinTinClient {
                     if let Some(session) = self.sessions.get_mut(&envelope.sender_id, 1) {
                         match session.decrypt(&session_msg) {
                             Ok(plaintext) => {
-                                Self::display_decrypted(&envelope.sender_id, &plaintext);
-                                self.record_decrypted(&envelope.sender_id, &plaintext);
+                                if !self.process_file_chunk(&envelope.sender_id, &plaintext) {
+                                    Self::display_decrypted(&envelope.sender_id, &plaintext);
+                                    self.record_decrypted(&envelope.sender_id, &plaintext);
+                                }
                                 // Send a read receipt back to the sender.
                                 self.send_receipt(
                                     &envelope.sender_id,
@@ -1008,6 +1024,198 @@ impl TinTinClient {
         Ok(resp["data"]["stories"].as_array().cloned().unwrap_or_default())
     }
 
+    // ── File Sharing ───────────────────────────────────────────
+
+    /// Send a file to another user (chunked, E2E encrypted).
+    async fn send_file(
+        &mut self,
+        recipient: &str,
+        file_path: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let path = std::path::Path::new(file_path);
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let file_data = std::fs::read(file_path)?;
+        let file_size = file_data.len() as u64;
+
+        const CHUNK_SIZE: usize = 256 * 1024; // 256 KB per chunk
+        let total_chunks = if file_data.is_empty() {
+            1
+        } else {
+            (file_data.len() + CHUNK_SIZE - 1) / CHUNK_SIZE
+        };
+
+        let file_id = format!(
+            "{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+
+        println!(
+            "📤 Sending '{}' ({} KB, {} chunk(s))...",
+            file_name,
+            file_size / 1024,
+            total_chunks
+        );
+
+        for (i, chunk) in file_data.chunks(CHUNK_SIZE).enumerate() {
+            let payload = serde_json::json!({
+                "__tintin_type": "file",
+                "file_id": file_id,
+                "file_name": file_name,
+                "file_size": file_size,
+                "total_chunks": total_chunks,
+                "chunk_index": i,
+                "data": crate::base64_encode(chunk),
+            });
+            let payload_bytes = serde_json::to_vec(&payload)?;
+
+            // Encrypt and send
+            let is_new = self.sessions.get_mut(recipient, 1).is_none();
+            if is_new {
+                let bundle = self.fetch_bundle(recipient).await?;
+                let new_session = Session::new_initiator(
+                    IdentityKeyPair {
+                        key_pair: KeyPair {
+                            secret: self.identity.key_pair.secret,
+                            public: self.identity.key_pair.public,
+                        },
+                    },
+                    recipient.to_string(),
+                    1,
+                    bundle.identity_key,
+                    &bundle.signed_pre_key,
+                )?;
+                self.sessions.add(new_session);
+            }
+
+            let session = self.sessions.get_mut(recipient, 1).unwrap();
+            let encrypted = session.encrypt(&payload_bytes)?;
+
+            let (content, msg_type) = if is_new {
+                let prekey = PreKeyBundleMessage {
+                    identity_key: *self.identity.public_key(),
+                    base_key: session.ratchet.dh_ratchet_key.public,
+                    session_message: encrypted,
+                };
+                (serde_json::to_vec(&prekey)?, MessageType::PreKeyBundle)
+            } else {
+                (encrypted.to_json()?, MessageType::Normal)
+            };
+
+            let envelope = Envelope::new(
+                self.user_id.clone(),
+                recipient.to_string(),
+                content,
+                msg_type,
+            );
+            let req = serde_json::json!({"cmd": "send", "envelope": envelope});
+            self.send_json(&req).await?;
+            let resp = self.recv_json().await?;
+            if resp["status"] != "ok" {
+                eprintln!("  ⚠️  Chunk {}/{} failed: {}", i + 1, total_chunks, resp["error"]);
+            }
+        }
+
+        // Track in sent messages.
+        self.sent_messages.push(SentMessage {
+            recipient: recipient.to_string(),
+            text: format!("📁 {} ({} KB)", file_name, file_size / 1024),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            status: MessageStatus::Sent,
+            edited: false,
+        });
+        self.save_history();
+        println!("✓ Sent '{}' to '{}'", file_name, recipient);
+        Ok(())
+    }
+
+    /// Process an incoming decrypted message that may be a file chunk.
+    /// Returns true if it was a file chunk (already displayed).
+    fn process_file_chunk(
+        &mut self,
+        sender: &str,
+        plaintext: &[u8],
+    ) -> bool {
+        let payload: serde_json::Value = match serde_json::from_slice(plaintext) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        if payload.get("__tintin_type").and_then(|v| v.as_str()) != Some("file") {
+            return false;
+        }
+
+        let file_id = payload["file_id"].as_str().unwrap_or("").to_string();
+        let file_name = payload["file_name"].as_str().unwrap_or("unknown").to_string();
+        let file_size = payload["file_size"].as_u64().unwrap_or(0);
+        let total_chunks = payload["total_chunks"].as_u64().unwrap_or(0) as usize;
+        let chunk_index = payload["chunk_index"].as_u64().unwrap_or(0) as usize;
+        let data_b64 = payload["data"].as_str().unwrap_or("");
+
+        let chunk_data = match base64_decode(data_b64) {
+            Ok(d) => d,
+            Err(_) => return true, // malformed chunk, skip
+        };
+
+        // Get or create pending file entry.
+        let pending = self.pending_files.entry(file_id.clone()).or_insert_with(|| {
+            println!("📁 Receiving '{}' ({} KB, {} chunks) from {}...",
+                file_name, file_size / 1024, total_chunks, sender);
+            PendingFile {
+                file_name: file_name.clone(),
+                file_size,
+                total_chunks,
+                received_chunks: HashMap::new(),
+            }
+        });
+        pending.received_chunks.insert(chunk_index, chunk_data);
+
+        // Check if complete.
+        if pending.received_chunks.len() == pending.total_chunks {
+            let name = pending.file_name.clone();
+            let size = pending.file_size;
+            // Reassemble in order.
+            let mut full_data = Vec::with_capacity(size as usize);
+            for i in 0..pending.total_chunks {
+                if let Some(chunk) = pending.received_chunks.remove(&i) {
+                    full_data.extend_from_slice(&chunk);
+                }
+            }
+            // Save to downloads directory.
+            let home = std::env::var("USERPROFILE")
+                .or_else(|_| std::env::var("HOME"))
+                .unwrap_or_else(|_| ".".to_string());
+            let dl_dir = PathBuf::from(home).join(".tintin").join("downloads");
+            let _ = std::fs::create_dir_all(&dl_dir);
+            let out_path = dl_dir.join(&name);
+            if let Err(e) = std::fs::write(&out_path, &full_data) {
+                eprintln!("⚠️ Could not save file '{}': {}", name, e);
+            } else {
+                println!(
+                    "✅ File '{}' saved ({} KB) → {}",
+                    name,
+                    size / 1024,
+                    out_path.display()
+                );
+            }
+            self.pending_files.remove(&file_id);
+        } else {
+            let pct = pending.received_chunks.len() * 100 / pending.total_chunks;
+            println!(
+                "  📦 {}/{} chunks ({})", pending.received_chunks.len(), pending.total_chunks, pct
+            );
+        }
+        true
+    }
+
     /// Receive a raw JSON value from the server.
     async fn recv_json(&self) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
         if let Some(reader) = &self.reader {
@@ -1022,6 +1230,18 @@ impl TinTinClient {
             Err("Not connected".into())
         }
     }
+}
+
+/// Base64-encode raw bytes for JSON-safe transport.
+fn base64_encode(data: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+/// Base64-decode a string back to raw bytes.
+fn base64_decode(data: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    use base64::Engine;
+    Ok(base64::engine::general_purpose::STANDARD.decode(data)?)
 }
 
 #[tokio::main]
@@ -1057,6 +1277,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  /group send id text — Send to a group");
     println!("  /edit <idx> text    — Edit a sent message (see /status for index)");
     println!("  /search <text>       — Search message history");
+    println!("  /sendfile <user> <path> — Send a file (E2E encrypted, chunked)");
     println!("  /story <text>        — Post a status story (24h expiry)");
     println!("  /stories             — View friends' active stories");
     println!("  /clearstory          — Remove your story");
@@ -1099,6 +1320,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  /group send id text — Send to a group");
             println!("  /edit <idx> text    — Edit a sent message");
             println!("  /search <text>       — Search message history");
+            println!("  /sendfile <user> <path> — Send a file (E2E encrypted, chunked)");
             println!("  /story <text>        — Post a status story (24h expiry)");
             println!("  /stories             — View friends' active stories");
             println!("  /clearstory          — Remove your story");
@@ -1326,6 +1548,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("Unknown group command: {subcmd}");
                     eprintln!("Available: create, join, leave, send");
                 }
+            }
+            continue;
+        }
+
+        if let Some(rest) = input.strip_prefix("/sendfile ") {
+            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+            if parts.len() < 2 {
+                eprintln!("Usage: /sendfile <user> <filepath>");
+                continue;
+            }
+            if let Err(e) = client.send_file(parts[0], parts[1]).await {
+                eprintln!("Error: {e}");
             }
             continue;
         }
