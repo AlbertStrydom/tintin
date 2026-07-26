@@ -1463,6 +1463,52 @@ impl TinTinClient {
         }
     }
 
+    // ── Sticker packs ─────────────────────────────────────────
+
+    /// Built-in sticker packs: pack_id -> [(sticker_id, emoji, alt_text)].
+    const STICKER_PACKS: &'static [(&'static str, &'static [(i64, &'static str, &'static str)])] = &[
+        ("wave", &[(1, "👋", "Wave"), (2, "👍", "Thumbs up"), (3, "✌️", "Peace"), (4, "🤙", "Call me")]),
+        ("face", &[(1, "😊", "Smile"), (2, "😂", "LOL"), (3, "😍", "Love"), (4, "😢", "Sad"), (5, "😡", "Angry")]),
+        ("heart", &[(1, "❤️", "Red heart"), (2, "🧡", "Orange heart"), (3, "💛", "Yellow heart"), (4, "💚", "Green heart"), (5, "💜", "Purple heart")]),
+        ("mood", &[(1, "🎉", "Party"), (2, "🔥", "Fire"), (3, "💯", "100"), (4, "⭐", "Star"), (5, "🎂", "Birthday")]),
+    ];
+
+    /// Send a sticker to a user.
+    async fn send_sticker(
+        &mut self,
+        recipient: &str,
+        pack_id: &str,
+        sticker_id: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Look up the emoji and alt text.
+        let mut emoji = "🖼️";
+        let mut alt = String::new();
+        for (pack, stickers) in Self::STICKER_PACKS {
+            if *pack == pack_id {
+                for (sid, e, a) in *stickers {
+                    if *sid == sticker_id {
+                        emoji = e;
+                        alt = a.to_string();
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+
+        let payload = serde_json::json!({
+            "__tintin_type": "sticker",
+            "pack_id": pack_id,
+            "sticker_id": sticker_id,
+            "emoji": emoji,
+            "alt": alt,
+        });
+        let text = serde_json::to_string(&payload)?;
+        self.send_message(recipient, &text).await?;
+        println!("{} Sent sticker to '{}': {} ({})", emoji, recipient, emoji, alt);
+        Ok(())
+    }
+
     /// Display decrypted message content, detecting group-tagged payloads.
     fn display_decrypted(sender: &str, plaintext: &[u8]) {
         // Check for TinTin structured message (group chat, etc.)
@@ -1497,6 +1543,18 @@ impl TinTinClient {
                 "call_end" => {
                     let reason = payload["reason"].as_str().unwrap_or("ended");
                     println!("📞 Call with {} {}", sender, reason);
+                    return;
+                }
+                "sticker" => {
+                    let pack = payload["pack_id"].as_str().unwrap_or("?");
+                    let sid = payload["sticker_id"].as_i64().unwrap_or(0);
+                    let emoji = payload["emoji"].as_str().unwrap_or("🖼️");
+                    let alt = payload["alt"].as_str().unwrap_or("");
+                    if alt.is_empty() {
+                        println!("{} {}: {} [{}#{}]", emoji, sender, emoji, pack, sid);
+                    } else {
+                        println!("{} {}: {} ({})", emoji, sender, emoji, alt);
+                    }
                     return;
                 }
                 "poll" => {
@@ -1541,6 +1599,9 @@ impl TinTinClient {
             } else if payload.get("__tintin_type").and_then(|v| v.as_str()) == Some("poll") {
                 let question = payload["question"].as_str().unwrap_or("Poll").to_string();
                 (format!("[Poll] {}", question), false, None, false, None)
+            } else if payload.get("__tintin_type").and_then(|v| v.as_str()) == Some("sticker") {
+                let emoji = payload["emoji"].as_str().unwrap_or("🖼️");
+                (format!("[Sticker] {}", emoji), false, None, false, None)
             } else if let Some(tt) = payload.get("__tintin_type").and_then(|v| v.as_str()) {
                 if tt == "call_offer" || tt == "call_accept" || tt == "call_end" {
                     ("[Call signal]".to_string(), false, None, false, None)
@@ -1863,6 +1924,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  /poll results <id>              — View poll results");
     println!("  /poll close <id>                — Close a poll (creator only)");
     println!("  /polls                          — List active polls");
+    println!("  /sticker <user> <pack> <id> — Send an emoji sticker");
     println!("  /call <user>                — Start an encrypted call");
     println!("  /accept <call_id>           — Accept incoming call");
     println!("  /end                       — End/hang up current call");
@@ -1920,6 +1982,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  /poll results <id>              — View poll results");
             println!("  /poll close <id>                — Close a poll (creator only)");
             println!("  /polls                          — List active polls");
+            println!("  /sticker <user> <pack> <id> — Send an emoji sticker");
             println!("  /call <user>                — Start an encrypted call");
             println!("  /accept <call_id>           — Accept incoming call");
             println!("  /end                       — End/hang up current call");
@@ -2358,6 +2421,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(e) => eprintln!("Error: {e}"),
             }
+            continue;
+        }
+
+        if let Some(rest) = input.strip_prefix("/sticker ") {
+            let parts: Vec<&str> = rest.splitn(3, ' ').collect();
+            if parts.len() < 3 {
+                eprintln!("Usage: /sticker <user> <pack_id> <sticker_id>");
+                eprintln!("Packs: wave, face, heart, mood");
+                eprintln!("  /sticker alice wave 1  -> 👋");
+                continue;
+            }
+            let sid: i64 = match parts[2].parse() {
+                Ok(v) => v,
+                Err(_) => { eprintln!("Invalid sticker id"); continue; }
+            };
+            if let Err(e) = client.send_sticker(parts[0], parts[1], sid).await {
+                eprintln!("Error: {e}");
+            }
+            continue;
+        }
+
+        if input.starts_with("/sticker") && input.len() <= 10 {
+            println!("Usage: /sticker <user> <pack_id> <sticker_id>");
+            println!("Packs:");
+            println!("  wave  — 👋 Wave, 👍 Thumbs up, ✌️ Peace, 🤙 Call me");
+            println!("  face  — 😊 Smile, 😂 LOL, 😍 Love, 😢 Sad, 😡 Angry");
+            println!("  heart — ❤️ Red, 🧡 Orange, 💛 Yellow, 💚 Green, 💜 Purple");
+            println!("  mood  — 🎉 Party, 🔥 Fire, 💯 100, ⭐ Star, 🎂 Birthday");
             continue;
         }
 
