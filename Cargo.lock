@@ -970,6 +970,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "tintin-sdk"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "tintin-server"
 version = "0.1.0"
 dependencies = [

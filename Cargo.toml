@@ -6,6 +6,7 @@ members = [
     "tintin-server",
     "tintin-ffi",
     "tintin-jni",
+    "tintin-sdk",
 ]
 
 [workspace.package]

@@ -1,0 +1,16 @@
+[package]
+name = "tintin-sdk"
+version.workspace = true
+edition.workspace = true
+license = "MIT"
+authors.workspace = true
+description = "TinTin Mini-App SDK — runtime types and sandbox protocol for third-party mini-apps"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+hex = { workspace = true }
+
+[lib]
+name = "tintin_sdk"
+path = "src/lib.rs"
