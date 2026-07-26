@@ -52,7 +52,13 @@ impl Store {
             );
 
             CREATE INDEX IF NOT EXISTS idx_group_members_user
-                ON group_members(user_id);",
+                ON group_members(user_id);
+
+            CREATE TABLE IF NOT EXISTS statuses (
+                user_id         TEXT PRIMARY KEY,
+                content         TEXT NOT NULL,
+                created_at      INTEGER NOT NULL
+            );",
         )?;
 
         Ok(Store {
@@ -183,6 +189,53 @@ impl Store {
         let mut stmt = conn.prepare("SELECT COUNT(*) FROM groups WHERE group_id = ?1")?;
         let count: i64 = stmt.query_row(params![group_id], |row| row.get(0))?;
         Ok(count > 0)
+    }
+
+    // ── Status / Stories ───────────────────────────────────────
+
+    /// Set (or update) a user's status/story. Returns the created_at timestamp.
+    pub fn set_status(&self, user_id: &str, content: &str) -> Result<u64, rusqlite::Error> {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO statuses (user_id, content, created_at) VALUES (?1, ?2, ?3)",
+            params![user_id, content, ts],
+        )?;
+        Ok(ts)
+    }
+
+    /// Clear a user's status.
+    pub fn clear_status(&self, user_id: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM statuses WHERE user_id = ?1", params![user_id])?;
+        Ok(())
+    }
+
+    /// Get all active statuses (younger than 24 hours).
+    pub fn get_active_statuses(&self) -> Result<Vec<serde_json::Value>, rusqlite::Error> {
+        let cutoff = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            - 86400; // 24 hours
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT user_id, content, created_at FROM statuses WHERE created_at > ?1 ORDER BY created_at DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![cutoff as i64], |row| {
+                Ok(serde_json::json!({
+                    "user_id": row.get::<_, String>(0)?,
+                    "content": row.get::<_, String>(1)?,
+                    "created_at": row.get::<_, i64>(2)?,
+                }))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
     }
 
     /// List registered user IDs, optionally filtered by a search query.

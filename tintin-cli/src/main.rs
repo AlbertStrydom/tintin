@@ -966,6 +966,48 @@ impl TinTinClient {
         self.record_message(sender, &text, false, is_group, group_name);
     }
 
+    // ── Status / Stories ───────────────────────────────────────
+
+    /// Set your status/story.
+    async fn set_story(&self, content: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let request = serde_json::json!({
+            "cmd": "set_status",
+            "user_id": self.user_id,
+            "content": content,
+        });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed to set status: {}", resp["error"]).into());
+        }
+        Ok(())
+    }
+
+    /// Clear your status/story.
+    async fn clear_story(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let request = serde_json::json!({
+            "cmd": "clear_status",
+            "user_id": self.user_id,
+        });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed to clear status: {}", resp["error"]).into());
+        }
+        Ok(())
+    }
+
+    /// View all active stories.
+    async fn get_stories(&self) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        let request = serde_json::json!({ "cmd": "get_stories" });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed to get stories: {}", resp["error"]).into());
+        }
+        Ok(resp["data"]["stories"].as_array().cloned().unwrap_or_default())
+    }
+
     /// Receive a raw JSON value from the server.
     async fn recv_json(&self) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
         if let Some(reader) = &self.reader {
@@ -1015,6 +1057,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  /group send id text — Send to a group");
     println!("  /edit <idx> text    — Edit a sent message (see /status for index)");
     println!("  /search <text>       — Search message history");
+    println!("  /story <text>        — Post a status story (24h expiry)");
+    println!("  /stories             — View friends' active stories");
+    println!("  /clearstory          — Remove your story");
     println!("  /status             — Show sent message status (✓/✓✓)");
     println!("  /help               — Show this help");
     println!("  /quit               — Exit");
@@ -1054,6 +1099,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  /group send id text — Send to a group");
             println!("  /edit <idx> text    — Edit a sent message");
             println!("  /search <text>       — Search message history");
+            println!("  /story <text>        — Post a status story (24h expiry)");
+            println!("  /stories             — View friends' active stories");
+            println!("  /clearstory          — Remove your story");
             println!("  /status             — Show sent message status (✓/✓✓)");
             println!("  /help               — Show this help");
             println!("  /quit               — Exit");
@@ -1172,6 +1220,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let new_text = parts[1];
             if let Err(e) = client.edit_message(index, new_text).await {
                 eprintln!("Error: {e}");
+            }
+            continue;
+        }
+
+        if let Some(text) = input.strip_prefix("/story ") {
+            if let Err(e) = client.set_story(text).await {
+                eprintln!("Error: {e}");
+            } else {
+                println!("📝 Story posted! (expires in 24h)");
+            }
+            continue;
+        }
+
+        if input == "/clearstory" {
+            if let Err(e) = client.clear_story().await {
+                eprintln!("Error: {e}");
+            } else {
+                println!("🗑️ Story cleared.");
+            }
+            continue;
+        }
+
+        if input == "/stories" {
+            match client.get_stories().await {
+                Ok(stories) => {
+                    if stories.is_empty() {
+                        println!("No active stories.");
+                    } else {
+                        println!("📖 Active stories:");
+                        for s in &stories {
+                            let user = s["user_id"].as_str().unwrap_or("?");
+                            let content = s["content"].as_str().unwrap_or("");
+                            let ts = s["created_at"].as_i64().unwrap_or(0);
+                            let hours_ago = (std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs() as i64
+                                - ts)
+                                / 3600;
+                            println!("  {} ({}h ago): {}", user, hours_ago, content);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Error: {e}"),
             }
             continue;
         }

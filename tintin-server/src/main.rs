@@ -174,6 +174,23 @@ struct GroupMembersCmd {
     group_id: String,
 }
 
+// ── Status / Stories ───────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct SetStatusCmd {
+    cmd: String,
+    user_id: String,
+    content: String,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct ClearStatusCmd {
+    cmd: String,
+    user_id: String,
+}
+
 async fn handle_command(line: &str, state: &AppState) -> ServerResponse {
     let value: serde_json::Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -208,6 +225,9 @@ async fn handle_command(line: &str, state: &AppState) -> ServerResponse {
         "leave_group" => handle_leave_group(&value, state).await,
         "my_groups" => handle_my_groups(&value, state).await,
         "group_members" => handle_group_members(&value, state).await,
+        "set_status" => handle_set_status(&value, state).await,
+        "clear_status" => handle_clear_status(&value, state).await,
+        "get_stories" => handle_get_stories(&value, state).await,
         _ => ServerResponse {
             status: "error".to_string(),
             data: None,
@@ -508,6 +528,81 @@ async fn handle_group_members(value: &serde_json::Value, state: &AppState) -> Se
             ServerResponse {
                 status: "ok".to_string(),
                 data: Some(serde_json::json!({"members": members})),
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+// ── Status / Stories handlers ──────────────────────────────────
+
+async fn handle_set_status(value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    let cmd: SetStatusCmd = match serde_json::from_value(value.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return ServerResponse {
+                status: "error".to_string(),
+                data: None,
+                error: Some(format!("Invalid payload: {e}")),
+            }
+        }
+    };
+    match state.store.set_status(&cmd.user_id, &cmd.content) {
+        Ok(ts) => {
+            eprintln!("  📝 Status set for '{}'", cmd.user_id);
+            ServerResponse {
+                status: "ok".to_string(),
+                data: Some(serde_json::json!({"created_at": ts})),
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+async fn handle_clear_status(value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    let cmd: ClearStatusCmd = match serde_json::from_value(value.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return ServerResponse {
+                status: "error".to_string(),
+                data: None,
+                error: Some(format!("Invalid payload: {e}")),
+            }
+        }
+    };
+    match state.store.clear_status(&cmd.user_id) {
+        Ok(()) => {
+            eprintln!("  🗑️ Status cleared for '{}'", cmd.user_id);
+            ServerResponse {
+                status: "ok".to_string(),
+                data: None,
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+async fn handle_get_stories(_value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    match state.store.get_active_statuses() {
+        Ok(statuses) => {
+            ServerResponse {
+                status: "ok".to_string(),
+                data: Some(serde_json::json!({"stories": statuses})),
                 error: None,
             }
         }
