@@ -134,6 +134,46 @@ struct ListUsersCmd {
     query: Option<String>,
 }
 
+// ── Group commands ──────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct CreateGroupCmd {
+    cmd: String,
+    name: String,
+    creator: String,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct JoinGroupCmd {
+    cmd: String,
+    group_id: String,
+    user_id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct LeaveGroupCmd {
+    cmd: String,
+    group_id: String,
+    user_id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct MyGroupsCmd {
+    cmd: String,
+    user_id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct GroupMembersCmd {
+    cmd: String,
+    group_id: String,
+}
+
 async fn handle_command(line: &str, state: &AppState) -> ServerResponse {
     let value: serde_json::Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -163,6 +203,11 @@ async fn handle_command(line: &str, state: &AppState) -> ServerResponse {
         "send" => handle_send(&value, state).await,
         "receive" => handle_receive(&value, state).await,
         "list_users" => handle_list_users(&value, state).await,
+        "create_group" => handle_create_group(&value, state).await,
+        "join_group" => handle_join_group(&value, state).await,
+        "leave_group" => handle_leave_group(&value, state).await,
+        "my_groups" => handle_my_groups(&value, state).await,
+        "group_members" => handle_group_members(&value, state).await,
         _ => ServerResponse {
             status: "error".to_string(),
             data: None,
@@ -318,6 +363,151 @@ async fn handle_list_users(value: &serde_json::Value, state: &AppState) -> Serve
             ServerResponse {
                 status: "ok".to_string(),
                 data: Some(serde_json::json!({"users": users})),
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+async fn handle_create_group(value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    let cmd: CreateGroupCmd = match serde_json::from_value(value.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return ServerResponse {
+                status: "error".to_string(),
+                data: None,
+                error: Some(format!("Invalid payload: {e}")),
+            }
+        }
+    };
+    match state.store.create_group(&cmd.name, &cmd.creator) {
+        Ok(group_id) => {
+            eprintln!("  👥 Group '{}' created (id={})", cmd.name, group_id);
+            ServerResponse {
+                status: "ok".to_string(),
+                data: Some(serde_json::json!({"group_id": group_id})),
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+async fn handle_join_group(value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    let cmd: JoinGroupCmd = match serde_json::from_value(value.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return ServerResponse {
+                status: "error".to_string(),
+                data: None,
+                error: Some(format!("Invalid payload: {e}")),
+            }
+        }
+    };
+    if !state.store.group_exists(&cmd.group_id).unwrap_or(false) {
+        return ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Group '{}' not found", cmd.group_id)),
+        };
+    }
+    match state.store.add_group_member(&cmd.group_id, &cmd.user_id) {
+        Ok(()) => {
+            eprintln!("  👤 {} joined group '{}'", cmd.user_id, cmd.group_id);
+            ServerResponse {
+                status: "ok".to_string(),
+                data: None,
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+async fn handle_leave_group(value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    let cmd: LeaveGroupCmd = match serde_json::from_value(value.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return ServerResponse {
+                status: "error".to_string(),
+                data: None,
+                error: Some(format!("Invalid payload: {e}")),
+            }
+        }
+    };
+    match state.store.remove_group_member(&cmd.group_id, &cmd.user_id) {
+        Ok(()) => {
+            eprintln!("  👤 {} left group '{}'", cmd.user_id, cmd.group_id);
+            ServerResponse {
+                status: "ok".to_string(),
+                data: None,
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+async fn handle_my_groups(value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    let cmd: MyGroupsCmd = match serde_json::from_value(value.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return ServerResponse {
+                status: "error".to_string(),
+                data: None,
+                error: Some(format!("Invalid payload: {e}")),
+            }
+        }
+    };
+    match state.store.list_my_groups(&cmd.user_id) {
+        Ok(groups) => {
+            ServerResponse {
+                status: "ok".to_string(),
+                data: Some(serde_json::json!({"groups": groups})),
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+async fn handle_group_members(value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    let cmd: GroupMembersCmd = match serde_json::from_value(value.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return ServerResponse {
+                status: "error".to_string(),
+                data: None,
+                error: Some(format!("Invalid payload: {e}")),
+            }
+        }
+    };
+    match state.store.list_group_members(&cmd.group_id) {
+        Ok(members) => {
+            ServerResponse {
+                status: "ok".to_string(),
+                data: Some(serde_json::json!({"members": members})),
                 error: None,
             }
         }

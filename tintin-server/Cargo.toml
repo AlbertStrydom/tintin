@@ -14,3 +14,4 @@ hex.workspace = true
 log.workspace = true
 env_logger.workspace = true
 rusqlite.workspace = true
+rand.workspace = true

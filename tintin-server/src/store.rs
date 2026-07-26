@@ -35,7 +35,24 @@ impl Store {
             );
 
             CREATE INDEX IF NOT EXISTS idx_messages_recipient
-                ON messages(recipient_id);",
+                ON messages(recipient_id);
+
+            CREATE TABLE IF NOT EXISTS groups (
+                group_id        TEXT PRIMARY KEY,
+                name            TEXT NOT NULL,
+                creator         TEXT NOT NULL,
+                created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS group_members (
+                group_id        TEXT NOT NULL REFERENCES groups(group_id),
+                user_id         TEXT NOT NULL,
+                role            TEXT NOT NULL DEFAULT 'member',
+                PRIMARY KEY (group_id, user_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_group_members_user
+                ON group_members(user_id);",
         )?;
 
         Ok(Store {
@@ -57,6 +74,115 @@ impl Store {
             params![user_id, identity_key, signed_pre_key],
         )?;
         Ok(())
+    }
+
+    /// Generate a short unique group ID (8 hex chars = ~4 billion namespace).
+    fn generate_group_id() -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let rnd = rand::random::<u16>() as u64;
+        format!("{:08x}", (millis & 0xFFFF_FFFF) ^ rnd)
+    }
+
+    /// Create a new group. Returns the generated group_id.
+    pub fn create_group(
+        &self,
+        name: &str,
+        creator: &str,
+    ) -> Result<String, rusqlite::Error> {
+        let group_id = Self::generate_group_id();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO groups (group_id, name, creator) VALUES (?1, ?2, ?3)",
+            params![group_id, name, creator],
+        )?;
+        // Creator is automatically an admin member.
+        conn.execute(
+            "INSERT INTO group_members (group_id, user_id, role) VALUES (?1, ?2, 'admin')",
+            params![group_id, creator],
+        )?;
+        Ok(group_id)
+    }
+
+    /// Add a member to a group.
+    pub fn add_group_member(
+        &self,
+        group_id: &str,
+        user_id: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO group_members (group_id, user_id, role) VALUES (?1, ?2, 'member')",
+            params![group_id, user_id],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a member from a group.
+    pub fn remove_group_member(
+        &self,
+        group_id: &str,
+        user_id: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM group_members WHERE group_id = ?1 AND user_id = ?2",
+            params![group_id, user_id],
+        )?;
+        Ok(())
+    }
+
+    /// List all groups that a user belongs to.
+    pub fn list_my_groups(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<serde_json::Value>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT g.group_id, g.name, g.creator, gm.role
+             FROM groups g
+             JOIN group_members gm ON g.group_id = gm.group_id
+             WHERE gm.user_id = ?1
+             ORDER BY g.name",
+        )?;
+        let rows = stmt
+            .query_map(params![user_id], |row| {
+                Ok(serde_json::json!({
+                    "group_id": row.get::<_, String>(0)?,
+                    "name": row.get::<_, String>(1)?,
+                    "creator": row.get::<_, String>(2)?,
+                    "role": row.get::<_, String>(3)?,
+                }))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// List all members of a group.
+    pub fn list_group_members(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<String>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT user_id FROM group_members WHERE group_id = ?1 ORDER BY user_id",
+        )?;
+        let users = stmt.query_map(params![group_id], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(users)
+    }
+
+    /// Check if a group exists.
+    pub fn group_exists(&self, group_id: &str) -> Result<bool, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT COUNT(*) FROM groups WHERE group_id = ?1")?;
+        let count: i64 = stmt.query_row(params![group_id], |row| row.get(0))?;
+        Ok(count > 0)
     }
 
     /// List registered user IDs, optionally filtered by a search query.

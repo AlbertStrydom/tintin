@@ -969,6 +969,7 @@ dependencies = [
  "env_logger",
  "hex",
  "log",
+ "rand",
  "rusqlite",
  "serde",
  "serde_json",

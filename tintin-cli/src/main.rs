@@ -4,6 +4,7 @@
 //! It handles user registration, session establishment, and sending/
 //! receiving end-to-end encrypted messages.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -32,6 +33,15 @@ struct SentMessage {
     status: MessageStatus,
 }
 
+/// A group we belong to.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct GroupInfo {
+    group_id: String,
+    name: String,
+    creator: String,
+    role: String,
+}
+
 /// A connected TinTin client instance.
 struct TinTinClient {
     /// Our user ID (phone number or username).
@@ -48,6 +58,8 @@ struct TinTinClient {
     reader: Option<Mutex<tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>>>,
     /// Track sent messages for ✓/✓✓ status.
     sent_messages: Vec<SentMessage>,
+    /// Groups we belong to (group_id -> info).
+    groups: HashMap<String, GroupInfo>,
 }
 
 impl TinTinClient {
@@ -64,8 +76,10 @@ impl TinTinClient {
             writer: None,
             reader: None,
             sent_messages: Vec::new(),
+            groups: HashMap::new(),
         };
         client.load_history();
+        client.load_groups();
         client
     }
 
@@ -107,6 +121,37 @@ impl TinTinClient {
                 }
             }
             Err(e) => eprintln!("⚠️ Could not serialize message history: {e}"),
+        }
+    }
+
+    /// Path to the groups file for this user.
+    fn groups_path(&self) -> PathBuf {
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_else(|_| ".".to_string());
+        let dir = PathBuf::from(home).join(".tintin");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(format!("{}_groups.json", self.user_id))
+    }
+
+    /// Load groups from disk.
+    fn load_groups(&mut self) {
+        let path = self.groups_path();
+        if !path.exists() {
+            return;
+        }
+        if let Ok(json) = std::fs::read_to_string(&path) {
+            if let Ok(groups) = serde_json::from_str::<HashMap<String, GroupInfo>>(&json) {
+                self.groups = groups;
+            }
+        }
+    }
+
+    /// Save groups to disk.
+    fn save_groups(&self) {
+        let path = self.groups_path();
+        if let Ok(json) = serde_json::to_string_pretty(&self.groups) {
+            let _ = std::fs::write(&path, &json);
         }
     }
 
@@ -323,8 +368,7 @@ impl TinTinClient {
                     match new_session.decrypt(&prekey.session_message) {
                         Ok(plaintext) => {
                             self.sessions.add(new_session);
-                            let text = String::from_utf8_lossy(&plaintext);
-                            println!("💬 {}: {}", envelope.sender_id, text);
+                            Self::display_decrypted(&envelope.sender_id, &plaintext);
                             // Send a read receipt back to the sender.
                             self.send_receipt(
                                 &envelope.sender_id,
@@ -361,8 +405,7 @@ impl TinTinClient {
                     if let Some(session) = self.sessions.get_mut(&envelope.sender_id, 1) {
                         match session.decrypt(&session_msg) {
                             Ok(plaintext) => {
-                                let text = String::from_utf8_lossy(&plaintext);
-                                println!("💬 {}: {}", envelope.sender_id, text);
+                                Self::display_decrypted(&envelope.sender_id, &plaintext);
                                 // Send a read receipt back to the sender.
                                 self.send_receipt(
                                     &envelope.sender_id,
@@ -503,6 +546,239 @@ impl TinTinClient {
         Ok(users)
     }
 
+    // ── Group methods ──────────────────────────────────────────
+
+    /// Create a new group on the server.
+    async fn create_group(
+        &mut self,
+        name: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let request = serde_json::json!({
+            "cmd": "create_group",
+            "name": name,
+            "creator": self.user_id,
+        });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed to create group: {}", resp["error"]).into());
+        }
+        let group_id = resp["data"]["group_id"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        // Store locally.
+        self.groups.insert(
+            group_id.clone(),
+            GroupInfo {
+                group_id: group_id.clone(),
+                name: name.to_string(),
+                creator: self.user_id.clone(),
+                role: "admin".to_string(),
+            },
+        );
+        self.save_groups();
+        Ok(group_id)
+    }
+
+    /// Join an existing group.
+    async fn join_group(&mut self, group_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let request = serde_json::json!({
+            "cmd": "join_group",
+            "group_id": group_id,
+            "user_id": self.user_id,
+        });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed to join group: {}", resp["error"]).into());
+        }
+        // Refresh local group info.
+        self.sync_groups().await?;
+        Ok(())
+    }
+
+    /// Leave a group.
+    async fn leave_group(&mut self, group_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let request = serde_json::json!({
+            "cmd": "leave_group",
+            "group_id": group_id,
+            "user_id": self.user_id,
+        });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed to leave group: {}", resp["error"]).into());
+        }
+        self.groups.remove(group_id);
+        self.save_groups();
+        Ok(())
+    }
+
+    /// Sync local group list from server.
+    async fn sync_groups(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let request = serde_json::json!({
+            "cmd": "my_groups",
+            "user_id": self.user_id,
+        });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed to list groups: {}", resp["error"]).into());
+        }
+        self.groups.clear();
+        if let Some(groups) = resp["data"]["groups"].as_array() {
+            for g in groups {
+                if let Some(info) = serde_json::from_value::<GroupInfo>(g.clone()).ok() {
+                    self.groups.insert(info.group_id.clone(), info);
+                }
+            }
+        }
+        self.save_groups();
+        Ok(())
+    }
+
+    /// Get member list for a group.
+    async fn group_members(&self, group_id: &str) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let request = serde_json::json!({
+            "cmd": "group_members",
+            "group_id": group_id,
+        });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed to get members: {}", resp["error"]).into());
+        }
+        let members: Vec<String> = resp["data"]["members"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        Ok(members)
+    }
+
+    /// Send a message to a group — encrypts once per member using
+    /// the existing pairwise session.
+    async fn send_group_message(
+        &mut self,
+        group_id: &str,
+        plaintext: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Get group info and member list.
+        let group_name = self
+            .groups
+            .get(group_id)
+            .map(|g| g.name.clone())
+            .unwrap_or_else(|| group_id.to_string());
+
+        let members = self.group_members(group_id).await?;
+        let others: Vec<&str> = members
+            .iter()
+            .filter(|m| *m != &self.user_id)
+            .map(|m| m.as_str())
+            .collect();
+
+        if others.is_empty() {
+            // Only ourselves — save as a regular saved message.
+            let my_id = self.user_id.clone();
+            return self.send_message(&my_id, plaintext).await;
+        }
+
+        // Build the group-tagged payload.
+        let payload = serde_json::json!({
+            "__tintin_type": "group",
+            "group_id": group_id,
+            "group_name": group_name,
+            "text": plaintext,
+        });
+        let payload_bytes = serde_json::to_vec(&payload)?;
+
+        // Send to each other member encrypted with their session.
+        for member in &others {
+            // Get or create session for this member.
+            let is_new = self.sessions.get_mut(member, 1).is_none();
+            if is_new {
+                let bundle = self.fetch_bundle(member).await?;
+                let new_session = Session::new_initiator(
+                    IdentityKeyPair {
+                        key_pair: KeyPair {
+                            secret: self.identity.key_pair.secret,
+                            public: self.identity.key_pair.public,
+                        },
+                    },
+                    member.to_string(),
+                    1,
+                    bundle.identity_key,
+                    &bundle.signed_pre_key,
+                )?;
+                self.sessions.add(new_session);
+            }
+
+            let session = self.sessions.get_mut(member, 1).unwrap();
+            let encrypted = session.encrypt(&payload_bytes)?;
+
+            let (content, msg_type) = if is_new {
+                let prekey = PreKeyBundleMessage {
+                    identity_key: *self.identity.public_key(),
+                    base_key: session.ratchet.dh_ratchet_key.public,
+                    session_message: encrypted,
+                };
+                (serde_json::to_vec(&prekey)?, MessageType::PreKeyBundle)
+            } else {
+                (encrypted.to_json()?, MessageType::Normal)
+            };
+
+            let envelope = Envelope::new(
+                self.user_id.clone(),
+                member.to_string(),
+                content,
+                msg_type,
+            );
+            let request = serde_json::json!({ "cmd": "send", "envelope": envelope });
+            self.send_json(&request).await?;
+            let resp = self.recv_json().await?;
+            if resp["status"] != "ok" {
+                eprintln!("  ⚠️  Failed to send to {}: {}", member, resp["error"]);
+            }
+        }
+
+        // Track in sent messages.
+        self.sent_messages.push(SentMessage {
+            recipient: format!("[{}] {}", group_name, group_id),
+            text: plaintext.to_string(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            status: MessageStatus::Sent,
+        });
+        self.save_history();
+        println!("✓ Sent to group '{}' ({} members)", group_name, others.len());
+        Ok(())
+    }
+
+    /// Display decrypted message content, detecting group-tagged payloads.
+    fn display_decrypted(sender: &str, plaintext: &[u8]) {
+        // Check for TinTin structured message (group chat, etc.)
+        if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(plaintext) {
+            if let Some(tt_type) = payload.get("__tintin_type").and_then(|v| v.as_str()) {
+                match tt_type {
+                    "group" => {
+                        let gname = payload["group_name"].as_str().unwrap_or("Group");
+                        let text = payload["text"].as_str().unwrap_or("");
+                        println!("[{}] {}: {}", gname, sender, text);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Regular message.
+        let text = String::from_utf8_lossy(plaintext);
+        println!("💬 {}: {}", sender, text);
+    }
+
     /// Receive a raw JSON value from the server.
     async fn recv_json(&self) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
         if let Some(reader) = &self.reader {
@@ -545,6 +821,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  /msg <yourname> ... — Saved Messages (message yourself)");
     println!("  /recv               — Check for new messages");
     println!("  /users              — List registered users");
+    println!("  /mygroups           — List your groups");
+    println!("  /group create name  — Create a new group");
+    println!("  /group join id      — Join an existing group");
+    println!("  /group leave id     — Leave a group");
+    println!("  /group send id text — Send to a group");
     println!("  /status             — Show sent message status (✓/✓✓)");
     println!("  /help               — Show this help");
     println!("  /quit               — Exit");
@@ -577,6 +858,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  /msg <yourname> ... — Saved Messages (message yourself)");
             println!("  /recv               — Poll for new messages");
             println!("  /users              — List registered users");
+            println!("  /mygroups           — List your groups");
+            println!("  /group create name  — Create a new group");
+            println!("  /group join id      — Join a group");
+            println!("  /group leave id     — Leave a group");
+            println!("  /group send id text — Send to a group");
             println!("  /status             — Show sent message status (✓/✓✓)");
             println!("  /help               — Show this help");
             println!("  /quit               — Exit");
@@ -621,6 +907,86 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(e) => eprintln!("Error: {e}"),
+            }
+            continue;
+        }
+
+        if input == "/mygroups" {
+            match client.sync_groups().await {
+                Ok(()) => {
+                    if client.groups.is_empty() {
+                        println!("You are not in any groups.");
+                    } else {
+                        println!("Your groups:");
+                        for g in client.groups.values() {
+                            let role = if g.role == "admin" { " (admin)" } else { "" };
+                            println!("  {}{} — {}", g.name, role, g.group_id);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Error: {e}"),
+            }
+            continue;
+        }
+
+        if let Some(rest) = input.strip_prefix("/group ") {
+            let parts: Vec<&str> = rest.splitn(3, ' ').collect();
+            if parts.is_empty() {
+                eprintln!("Usage:");
+                eprintln!("  /group create <name>");
+                eprintln!("  /group join <group_id>");
+                eprintln!("  /group leave <group_id>");
+                eprintln!("  /group send <group_id> <text>");
+                continue;
+            }
+            let subcmd = parts[0];
+            match subcmd {
+                "create" => {
+                    if parts.len() < 2 {
+                        eprintln!("Usage: /group create <name>");
+                        continue;
+                    }
+                    match client.create_group(parts[1]).await {
+                        Ok(id) => println!("✓ Group '{}' created (id: {})", parts[1], id),
+                        Err(e) => eprintln!("Error: {e}"),
+                    }
+                }
+                "join" => {
+                    if parts.len() < 2 {
+                        eprintln!("Usage: /group join <group_id>");
+                        continue;
+                    }
+                    match client.join_group(parts[1]).await {
+                        Ok(()) => println!("✓ Joined group {}", parts[1]),
+                        Err(e) => eprintln!("Error: {e}"),
+                    }
+                }
+                "leave" => {
+                    if parts.len() < 2 {
+                        eprintln!("Usage: /group leave <group_id>");
+                        continue;
+                    }
+                    match client.leave_group(parts[1]).await {
+                        Ok(()) => println!("✓ Left group {}", parts[1]),
+                        Err(e) => eprintln!("Error: {e}"),
+                    }
+                }
+                "send" => {
+                    if parts.len() < 3 {
+                        eprintln!("Usage: /group send <group_id> <text>");
+                        continue;
+                    }
+                    let gid = parts[1];
+                    let text = parts[2];
+                    match client.send_group_message(gid, text).await {
+                        Ok(()) => {}
+                        Err(e) => eprintln!("Error: {e}"),
+                    }
+                }
+                _ => {
+                    eprintln!("Unknown group command: {subcmd}");
+                    eprintln!("Available: create, join, leave, send");
+                }
             }
             continue;
         }
