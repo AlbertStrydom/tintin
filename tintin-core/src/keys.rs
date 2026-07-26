@@ -5,7 +5,7 @@ use zeroize::Zeroize;
 use crate::error::Result;
 
 /// A X25519 key pair (ephemeral or long-term).
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyPair {
     /// The private (secret) key — 32 bytes.
     #[serde(with = "serde_secret_key")]

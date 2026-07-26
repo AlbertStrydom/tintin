@@ -16,6 +16,24 @@ use tintin_core::{
     ReceiptType, Session, SessionMessage, SessionStore, SignedPreKey,
 };
 
+/// Active call state tracking.
+#[derive(Debug, Clone)]
+struct ActiveCall {
+    peer: String,
+    call_id: String,
+    media_key_pair: KeyPair,
+    peer_media_key: Option<[u8; 32]>,
+    shared_media_secret: Option<[u8; 32]>,
+    state: CallState,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum CallState {
+    Offering,
+    Ringing,
+    Connected,
+}
+
 /// Status of a sent message for ✓/✓✓ tracking.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 enum MessageStatus {
@@ -100,6 +118,8 @@ struct TinTinClient {
     pending_files: HashMap<String, PendingFile>,
     /// Channels we're subscribed to (channel_id -> name).
     channels: HashMap<i64, String>,
+    /// Active call state, if any.
+    active_call: Option<ActiveCall>,
 }
 
 impl TinTinClient {
@@ -120,6 +140,7 @@ impl TinTinClient {
             chat_log: Vec::new(),
             pending_files: HashMap::new(),
             channels: HashMap::new(),
+            active_call: None,
         };
         client.load_history();
         client.load_groups();
@@ -580,7 +601,8 @@ impl TinTinClient {
                     match new_session.decrypt(&prekey.session_message) {
                         Ok(plaintext) => {
                             self.sessions.add(new_session);
-                            if !self.process_file_chunk(&envelope.sender_id, &plaintext) {
+                            let is_call_signal = self.process_call_signal(&envelope.sender_id, &plaintext);
+                            if !is_call_signal && !self.process_file_chunk(&envelope.sender_id, &plaintext) {
                                 Self::display_decrypted(&envelope.sender_id, &plaintext);
                                 self.record_decrypted(&envelope.sender_id, &plaintext);
                             }
@@ -622,7 +644,8 @@ impl TinTinClient {
                     if let Some(session) = self.sessions.get_mut(&envelope.sender_id, 1) {
                         match session.decrypt(&session_msg) {
                             Ok(plaintext) => {
-                                if !self.process_file_chunk(&envelope.sender_id, &plaintext) {
+                                let is_call_signal = self.process_call_signal(&envelope.sender_id, &plaintext);
+                                if !is_call_signal && !self.process_file_chunk(&envelope.sender_id, &plaintext) {
                                     Self::display_decrypted(&envelope.sender_id, &plaintext);
                                     self.record_decrypted(&envelope.sender_id, &plaintext);
                                 }
@@ -1289,6 +1312,157 @@ impl TinTinClient {
         Ok(())
     }
 
+    // ── Call methods ──────────────────────────────────────────
+
+    /// Initiate a call to another user.
+    async fn start_call(&mut self, peer: &str) -> Result<(), Box<dyn std::error::Error>> {
+        if self.active_call.is_some() {
+            return Err("Already in a call. Use /end to hang up first.".into());
+        }
+
+        let call_id = format!("{}_{}", self.user_id, 
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis());
+
+        let media_key_pair = KeyPair::generate();
+        let media_pub_hex = hex::encode(media_key_pair.public);
+
+        let payload = serde_json::json!({
+            "__tintin_type": "call_offer",
+            "call_id": call_id,
+            "media_key_pub": media_pub_hex,
+        });
+
+        self.active_call = Some(ActiveCall {
+            peer: peer.to_string(),
+            call_id: call_id.clone(),
+            media_key_pair,
+            peer_media_key: None,
+            shared_media_secret: None,
+            state: CallState::Offering,
+        });
+
+        let text = serde_json::to_string(&payload)?;
+        self.send_message(peer, &text).await?;
+        println!("📞 Calling {}... (call id: {})", peer, call_id);
+        println!("  (use /end to cancel)");
+        Ok(())
+    }
+
+    /// Accept an incoming call.
+    async fn accept_call(&mut self, call_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let peer = match &self.active_call {
+            Some(c) if c.call_id == call_id => c.peer.clone(),
+            Some(_) => return Err("Active call has different ID".into()),
+            None => return Err("No incoming call to accept".into()),
+        };
+
+        let media_key_pair = KeyPair::generate();
+        let media_pub_hex = hex::encode(media_key_pair.public);
+
+        let payload = serde_json::json!({
+            "__tintin_type": "call_accept",
+            "call_id": call_id,
+            "media_key_pub": media_pub_hex,
+        });
+
+        // Derive shared media secret from the caller's media key.
+        if let Some(ref mut call) = self.active_call {
+            call.state = CallState::Connected;
+            call.media_key_pair = media_key_pair;
+            if let Some(peer_pk) = call.peer_media_key {
+                let shared = call.media_key_pair.agree(&peer_pk).ok();
+                call.shared_media_secret = shared;
+                if shared.is_some() {
+                    println!("  🔑 Secure media channel established");
+                }
+            }
+        }
+
+        let text = serde_json::to_string(&payload)?;
+        self.send_message(&peer, &text).await?;
+        println!("📞 Call {} connected with {}", call_id, peer);
+        Ok(())
+    }
+
+    /// End the current call.
+    async fn end_call(&mut self, reason: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let peer = match &self.active_call {
+            Some(c) => c.peer.clone(),
+            None => return Err("No active call".into()),
+        };
+        let call_id = self.active_call.as_ref().map(|c| c.call_id.clone()).unwrap_or_default();
+
+        let payload = serde_json::json!({
+            "__tintin_type": "call_end",
+            "call_id": call_id,
+            "reason": reason,
+        });
+
+        let text = serde_json::to_string(&payload)?;
+        self.send_message(&peer, &text).await?;
+        println!("📞 Call with {} ended", peer);
+        self.active_call = None;
+        Ok(())
+    }
+
+    /// Process an incoming call signal (called from receive loop after decrypt).
+    fn process_call_signal(&mut self, sender: &str, plaintext: &[u8]) -> bool {
+        let payload: serde_json::Value = match serde_json::from_slice(plaintext) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        let tt = match payload.get("__tintin_type").and_then(|v| v.as_str()) {
+            Some(t) => t,
+            None => return false,
+        };
+
+        match tt {
+            "call_offer" => {
+                let call_id = payload["call_id"].as_str().unwrap_or("?").to_string();
+                let media_pub_hex = payload["media_key_pub"].as_str().unwrap_or("");
+                let peer_pk = hex::decode(media_pub_hex).ok()
+                    .and_then(|b| b.try_into().ok());
+
+                // Create a pending incoming call state
+                let media_kp = KeyPair::generate(); // placeholder, will be replaced on accept
+                self.active_call = Some(ActiveCall {
+                    peer: sender.to_string(),
+                    call_id,
+                    media_key_pair: media_kp,
+                    peer_media_key: peer_pk,
+                    shared_media_secret: None,
+                    state: CallState::Ringing,
+                });
+                true
+            }
+            "call_accept" => {
+                if let Some(ref mut call) = self.active_call {
+                    if call.state == CallState::Offering || call.state == CallState::Ringing {
+                        let media_pub_hex = payload["media_key_pub"].as_str().unwrap_or("");
+                        if let Some(peer_pk) = hex::decode(media_pub_hex)
+                            .ok()
+                            .and_then(|b: Vec<u8>| <[u8; 32]>::try_from(b).ok())
+                        {
+                            call.peer_media_key = Some(peer_pk);
+                            let shared = call.media_key_pair.agree(&peer_pk).ok();
+                            call.shared_media_secret = shared;
+                            call.state = CallState::Connected;
+                        }
+                    }
+                }
+                true
+            }
+            "call_end" => {
+                self.active_call = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Display decrypted message content, detecting group-tagged payloads.
     fn display_decrypted(sender: &str, plaintext: &[u8]) {
         // Check for TinTin structured message (group chat, etc.)
@@ -1305,6 +1479,24 @@ impl TinTinClient {
                     let cname = payload["channel_name"].as_str().unwrap_or("Channel");
                     let text = payload["text"].as_str().unwrap_or("");
                     println!("📢 [{}] {}: {}", cname, sender, text);
+                    return;
+                }
+                "call_offer" => {
+                    let call_id = payload["call_id"].as_str().unwrap_or("?");
+                    println!("📞 Incoming call from {} — /accept {} to answer, /end to reject", sender, call_id);
+                    return;
+                }
+                "call_accept" => {
+                    let call_id = payload["call_id"].as_str().unwrap_or("?");
+                    println!("📞 {} accepted call {} — call connected!", sender, call_id);
+                    if let Some(_pk) = payload["media_key_pub"].as_str() {
+                        println!("  🔑 Media key exchanged, secure channel ready");
+                    }
+                    return;
+                }
+                "call_end" => {
+                    let reason = payload["reason"].as_str().unwrap_or("ended");
+                    println!("📞 Call with {} {}", sender, reason);
                     return;
                 }
                 "poll" => {
@@ -1349,6 +1541,12 @@ impl TinTinClient {
             } else if payload.get("__tintin_type").and_then(|v| v.as_str()) == Some("poll") {
                 let question = payload["question"].as_str().unwrap_or("Poll").to_string();
                 (format!("[Poll] {}", question), false, None, false, None)
+            } else if let Some(tt) = payload.get("__tintin_type").and_then(|v| v.as_str()) {
+                if tt == "call_offer" || tt == "call_accept" || tt == "call_end" {
+                    ("[Call signal]".to_string(), false, None, false, None)
+                } else {
+                    (String::from_utf8_lossy(plaintext).to_string(), false, None, false, None)
+                }
             } else {
                 (String::from_utf8_lossy(plaintext).to_string(), false, None, false, None)
             }
@@ -1665,6 +1863,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  /poll results <id>              — View poll results");
     println!("  /poll close <id>                — Close a poll (creator only)");
     println!("  /polls                          — List active polls");
+    println!("  /call <user>                — Start an encrypted call");
+    println!("  /accept <call_id>           — Accept incoming call");
+    println!("  /end                       — End/hang up current call");
     println!("  /story <text>        — Post a status story (24h expiry)");
     println!("  /stories             — View friends' active stories");
     println!("  /clearstory          — Remove your story");
@@ -1719,6 +1920,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  /poll results <id>              — View poll results");
             println!("  /poll close <id>                — Close a poll (creator only)");
             println!("  /polls                          — List active polls");
+            println!("  /call <user>                — Start an encrypted call");
+            println!("  /accept <call_id>           — Accept incoming call");
+            println!("  /end                       — End/hang up current call");
             println!("  /story <text>        — Post a status story (24h expiry)");
             println!("  /stories             — View friends' active stories");
             println!("  /clearstory          — Remove your story");
@@ -2153,6 +2357,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(e) => eprintln!("Error: {e}"),
+            }
+            continue;
+        }
+
+        if let Some(rest) = input.strip_prefix("/call ") {
+            let peer = rest.trim();
+            if peer.is_empty() {
+                eprintln!("Usage: /call <username>");
+                continue;
+            }
+            if let Err(e) = client.start_call(peer).await {
+                eprintln!("Error: {e}");
+            }
+            continue;
+        }
+
+        if let Some(rest) = input.strip_prefix("/accept ") {
+            let call_id = rest.trim();
+            if call_id.is_empty() {
+                eprintln!("Usage: /accept <call_id>");
+                continue;
+            }
+            if let Err(e) = client.accept_call(call_id).await {
+                eprintln!("Error: {e}");
+            }
+            continue;
+        }
+
+        if input == "/end" || input == "/hangup" {
+            if let Err(e) = client.end_call("ended").await {
+                eprintln!("Error: {e}");
             }
             continue;
         }
