@@ -100,6 +100,7 @@ impl Store {
             CREATE TABLE IF NOT EXISTS timeline_posts (
                 post_id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id         TEXT NOT NULL,
+                target_user_id  TEXT,
                 content         TEXT NOT NULL,
                 created_at      INTEGER NOT NULL
             );
@@ -118,6 +119,9 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_timeline_comments_post
                 ON timeline_comments(post_id);",
         )?;
+
+        // Migration: add target_user_id column for wall posting on existing databases.
+        let _ = conn.execute_batch("ALTER TABLE timeline_posts ADD COLUMN target_user_id TEXT;");
 
         Ok(Store {
             conn: Mutex::new(conn),
@@ -678,15 +682,20 @@ impl Store {
     // ── Timeline / Moments ────────────────────────────────────
 
     /// Post to timeline. Returns the post_id.
-    pub fn create_post(&self, user_id: &str, content: &str) -> Result<i64, rusqlite::Error> {
+    pub fn create_post(
+        &self,
+        user_id: &str,
+        content: &str,
+        target_user_id: Option<&str>,
+    ) -> Result<i64, rusqlite::Error> {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO timeline_posts (user_id, content, created_at) VALUES (?1, ?2, ?3)",
-            params![user_id, content, ts],
+            "INSERT INTO timeline_posts (user_id, target_user_id, content, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![user_id, target_user_id, content, ts],
         )?;
         Ok(conn.last_insert_rowid())
     }
@@ -715,7 +724,7 @@ impl Store {
         // We also include the user's own posts.
 
         let mut stmt = conn.prepare(
-            "SELECT p.post_id, p.user_id, p.content, p.created_at,
+            "SELECT p.post_id, p.user_id, p.content, p.created_at, p.target_user_id,
                     (SELECT COUNT(*) FROM timeline_comments WHERE post_id = p.post_id) as comment_count
              FROM timeline_posts p
              WHERE p.user_id = ?1
@@ -725,8 +734,9 @@ impl Store {
                     UNION
                     SELECT DISTINCT sender_id FROM messages WHERE recipient_id = ?1
                     UNION
-                    SELECT DISTINCT recipient_id FROM messages WHERE recipient_id = ?1
+                    SELECT DISTINCT recipient_id FROM messages WHERE sender_id = ?1
                 )
+                OR p.target_user_id = ?1
              ORDER BY p.created_at DESC
              LIMIT 100",
         )?;
@@ -738,7 +748,8 @@ impl Store {
                     "user_id": row.get::<_, String>(1)?,
                     "content": row.get::<_, String>(2)?,
                     "created_at": row.get::<_, i64>(3)?,
-                    "comment_count": row.get::<_, i64>(4)?,
+                    "target_user_id": row.get::<_, Option<String>>(4)?,
+                    "comment_count": row.get::<_, i64>(5)?,
                 }))
             })?
             .filter_map(|r| r.ok())

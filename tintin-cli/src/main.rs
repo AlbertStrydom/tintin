@@ -1314,13 +1314,20 @@ impl TinTinClient {
 
     // ── Timeline / Moments ────────────────────────────────────
 
-    /// Post to your timeline.
-    async fn post_to_timeline(&self, content: &str) -> Result<i64, Box<dyn std::error::Error>> {
-        let request = serde_json::json!({
+    /// Post to your timeline (or someone else's wall).
+    async fn post_to_timeline(
+        &self,
+        content: &str,
+        target_user: Option<&str>,
+    ) -> Result<i64, Box<dyn std::error::Error>> {
+        let mut request = serde_json::json!({
             "cmd": "create_post",
             "user_id": self.user_id,
             "content": content,
         });
+        if let Some(tu) = target_user {
+            request["target_user_id"] = serde_json::Value::String(tu.to_string());
+        }
         self.send_json(&request).await?;
         let resp = self.recv_json().await?;
         if resp["status"] != "ok" {
@@ -2119,7 +2126,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  /poll close <id>                — Close a poll (creator only)");
             println!("  /polls                          — List active polls");
             println!("  /sticker <user> <pack> <id> — Send an emoji sticker");
-            println!("  /moment <text>          — Post to your timeline");
+    println!("  /moment <text>          — Post to your timeline");
+    println!("  /moment <user> <text>   — Post on someone's wall");
             println!("  /timeline               — View your timeline");
             println!("  /comment <id> <text>    — Comment on a timeline post");
             println!("  /postcomments <id>      — View comments on a post");
@@ -2627,13 +2635,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if let Some(rest) = input.strip_prefix("/moment ") {
-            let content = rest.trim();
-            if content.is_empty() {
-                eprintln!("Usage: /moment <text>");
+            let rest = rest.trim();
+            if rest.is_empty() {
+                eprintln!("Usage: /moment <text> or /moment <user> <text>");
                 continue;
             }
-            match client.post_to_timeline(content).await {
-                Ok(id) => println!("📝 Posted to timeline (id: {})", id),
+            // Check if it has two parts (user + text)
+            if let Some((target, text)) = rest.split_once(' ') {
+                if !text.is_empty() {
+                    match client.post_to_timeline(text, Some(target)).await {
+                        Ok(id) => println!("📝 Posted on {}'s timeline (id: {})", target, id),
+                        Err(e) => eprintln!("Error: {e}"),
+                    }
+                    continue;
+                }
+            }
+            // Single argument — own timeline
+            match client.post_to_timeline(rest, None).await {
+                Ok(id) => println!("📝 Posted to your timeline (id: {})", id),
                 Err(e) => eprintln!("Error: {e}"),
             }
             continue;
@@ -2650,7 +2669,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let uid = p["user_id"].as_str().unwrap_or("?");
                             let content = p["content"].as_str().unwrap_or("");
                             let cc = p["comment_count"].as_i64().unwrap_or(0);
-                            println!("[{}] {}: {}", p["post_id"], uid, content);
+                            let target = p["target_user_id"].as_str().and_then(|t| if t.is_empty() { None } else { Some(t) });
+                            match target {
+                                Some(tu) => println!("[{}] {} → {}: {}", p["post_id"], uid, tu, content),
+                                None => println!("[{}] {}: {}", p["post_id"], uid, content),
+                            }
                             if cc > 0 {
                                 println!("     💬 {} comment(s) — /postcomments {}", cc, p["post_id"]);
                             }

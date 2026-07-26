@@ -1020,6 +1020,8 @@ struct CreatePostCmd {
     cmd: String,
     user_id: String,
     content: String,
+    #[serde(default)]
+    target_user_id: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1063,7 +1065,7 @@ async fn handle_create_post(value: &serde_json::Value, state: &AppState) -> Serv
             }
         }
     };
-    match state.store.create_post(&cmd.user_id, &cmd.content) {
+    match state.store.create_post(&cmd.user_id, &cmd.content, cmd.target_user_id.as_deref()) {
         Ok(post_id) => {
             eprintln!("  📝 {} posted to timeline (id={})", cmd.user_id, post_id);
             ServerResponse {
