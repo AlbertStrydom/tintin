@@ -1190,12 +1190,11 @@ mod tests {
 
     /// Helper: create an AppState backed by a temporary in-memory database.
     fn test_state() -> Arc<AppState> {
+        use std::time::{SystemTime, UNIX_EPOCH};
         let path = std::env::temp_dir().join(format!(
-            "tintin-test-{}.db",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "tintin-test-{}-{}.db",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+            std::process::id(),
         ));
         let path_str = path.to_str().unwrap();
         let store = Store::open(path_str).expect("Failed to create test store");
@@ -1272,12 +1271,11 @@ mod tests {
     async fn test_persistence_across_reconnect() {
         // Simulate server restart by creating two sequential store instances
         // pointing at the same file.
+        use std::time::{SystemTime, UNIX_EPOCH};
         let path = std::env::temp_dir().join(format!(
-            "tintin-persist-{}.db",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "tintin-persist-{}-{}.db",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+            std::process::id(),
         ));
         let path = path.to_str().unwrap().to_string();
 
@@ -1390,5 +1388,330 @@ mod tests {
         let users = data["users"].as_array().unwrap();
         assert_eq!(users.len(), 1);
         assert_eq!(users[0].as_str().unwrap(), "alice");
+    }
+
+    // ── Channel tests ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_channel_create_subscribe_list() {
+        let state = test_state();
+
+        // Create a channel.
+        let create = serde_json::json!({
+            "cmd": "create_channel",
+            "name": "test-channel",
+            "owner_id": "alice",
+        });
+        let resp = handle_command(&create.to_string(), &state).await;
+        assert_eq!(resp.status, "ok", "create channel");
+        let channel_id = resp.data.unwrap()["channel_id"].as_i64().unwrap();
+
+        // List all channels.
+        let list = serde_json::json!({"cmd": "list_channels"});
+        let resp = handle_command(&list.to_string(), &state).await;
+        assert_eq!(resp.status, "ok", "list channels");
+        let channels = resp.data.unwrap()["channels"].as_array().unwrap().clone();
+        assert_eq!(channels.len(), 1);
+        assert_eq!(channels[0]["name"].as_str().unwrap(), "test-channel");
+
+        // Subscribe bob.
+        let sub = serde_json::json!({
+            "cmd": "subscribe_channel",
+            "channel_id": channel_id,
+            "user_id": "bob",
+        });
+        let resp = handle_command(&sub.to_string(), &state).await;
+        assert_eq!(resp.status, "ok", "subscribe bob");
+
+        // My channels (bob).
+        let my = serde_json::json!({
+            "cmd": "my_channels",
+            "channel_id": channel_id,
+            "user_id": "bob",
+        });
+        let resp = handle_command(&my.to_string(), &state).await;
+        assert_eq!(resp.status, "ok", "bob my_channels");
+        let bob_channels = resp.data.unwrap()["channels"].as_array().unwrap().clone();
+        assert_eq!(bob_channels.len(), 1);
+
+        // Channel members.
+        let members = serde_json::json!({
+            "cmd": "channel_members",
+            "channel_id": channel_id,
+        });
+        let resp = handle_command(&members.to_string(), &state).await;
+        assert_eq!(resp.status, "ok", "channel members");
+        let member_list = resp.data.unwrap()["members"].as_array().unwrap().clone();
+        assert_eq!(member_list.len(), 2);
+        let names: Vec<&str> = member_list.iter().map(|m| m.as_str().unwrap()).collect();
+        assert!(names.contains(&"alice"));
+        assert!(names.contains(&"bob"));
+
+        // Unsubscribe bob.
+        let unsub = serde_json::json!({
+            "cmd": "unsubscribe_channel",
+            "channel_id": channel_id,
+            "user_id": "bob",
+        });
+        let resp = handle_command(&unsub.to_string(), &state).await;
+        assert_eq!(resp.status, "ok", "unsubscribe bob");
+
+        // Bob's channels should now be empty.
+        let resp = handle_command(&my.to_string(), &state).await;
+        assert_eq!(resp.status, "ok");
+        let bob_channels = resp.data.unwrap()["channels"].as_array().unwrap().clone();
+        assert_eq!(bob_channels.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_channel_subscribe_nonexistent() {
+        let state = test_state();
+        let sub = serde_json::json!({
+            "cmd": "subscribe_channel",
+            "channel_id": 999,
+            "user_id": "alice",
+        });
+        let resp = handle_command(&sub.to_string(), &state).await;
+        assert_eq!(resp.status, "error", "subscribing to nonexistent channel");
+        assert!(resp.error.unwrap().contains("not found"));
+    }
+
+    // ── Poll tests ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_poll_create_vote_results_close() {
+        let state = test_state();
+
+        // Create a poll.
+        let create = serde_json::json!({
+            "cmd": "create_poll",
+            "creator": "alice",
+            "question": "Best color?",
+            "options": ["Red", "Blue", "Green"],
+        });
+        let resp = handle_command(&create.to_string(), &state).await;
+        assert_eq!(resp.status, "ok", "create poll");
+        let poll_id = resp.data.unwrap()["poll_id"].as_i64().unwrap();
+
+        // List polls.
+        let list = serde_json::json!({"cmd": "list_polls"});
+        let resp = handle_command(&list.to_string(), &state).await;
+        assert_eq!(resp.status, "ok", "list polls");
+        let polls = resp.data.unwrap()["polls"].as_array().unwrap().clone();
+        assert_eq!(polls.len(), 1);
+        assert_eq!(polls[0]["question"].as_str().unwrap(), "Best color?");
+
+        // Alice votes for Red (option_id = 1).
+        let vote = serde_json::json!({
+            "cmd": "vote_poll",
+            "poll_id": poll_id,
+            "user_id": "alice",
+            "option_id": 1,
+        });
+        let resp = handle_command(&vote.to_string(), &state).await;
+        assert_eq!(resp.status, "ok", "alice vote");
+
+        // Bob votes for Blue (option_id = 2).
+        let vote2 = serde_json::json!({
+            "cmd": "vote_poll",
+            "poll_id": poll_id,
+            "user_id": "bob",
+            "option_id": 2,
+        });
+        let resp = handle_command(&vote2.to_string(), &state).await;
+        assert_eq!(resp.status, "ok", "bob vote");
+
+        // Poll results should show 1 vote each for Red and Blue.
+        let results = serde_json::json!({
+            "cmd": "poll_results",
+            "poll_id": poll_id,
+        });
+        let resp = handle_command(&results.to_string(), &state).await;
+        assert_eq!(resp.status, "ok", "poll results");
+        let data = resp.data.unwrap();
+        assert_eq!(data["question"].as_str().unwrap(), "Best color?");
+        assert_eq!(data["active"].as_bool().unwrap(), true);
+        let opts = data["options"].as_array().unwrap();
+        // Options should contain vote counts.
+        let red = opts.iter().find(|o| o["option_text"].as_str() == Some("Red")).unwrap();
+        assert_eq!(red["votes"].as_i64().unwrap(), 1);
+        let blue = opts.iter().find(|o| o["option_text"].as_str() == Some("Blue")).unwrap();
+        assert_eq!(blue["votes"].as_i64().unwrap(), 1);
+        let green = opts.iter().find(|o| o["option_text"].as_str() == Some("Green")).unwrap();
+        assert_eq!(green["votes"].as_i64().unwrap(), 0);
+
+        // Duplicate vote (same option) is allowed — vote changing is supported.
+        let resp = handle_command(&vote.to_string(), &state).await;
+        assert_eq!(resp.status, "ok", "duplicate vote (vote changing)");
+
+        // Close poll.
+        let close = serde_json::json!({
+            "cmd": "close_poll",
+            "poll_id": poll_id,
+            "user_id": "alice",
+        });
+        let resp = handle_command(&close.to_string(), &state).await;
+        assert_eq!(resp.status, "ok", "close poll");
+
+        // Confirm closed.
+        let resp = handle_command(&results.to_string(), &state).await;
+        assert_eq!(resp.status, "ok");
+        assert_eq!(resp.data.unwrap()["active"].as_bool().unwrap(), false);
+
+        // Voting on closed poll should fail.
+        let resp = handle_command(&vote2.to_string(), &state).await;
+        assert_eq!(resp.status, "error", "vote on closed poll");
+    }
+
+    #[tokio::test]
+    async fn test_poll_too_few_options() {
+        let state = test_state();
+        let create = serde_json::json!({
+            "cmd": "create_poll",
+            "creator": "alice",
+            "question": "Yes or no?",
+            "options": ["Yes"],
+        });
+        let resp = handle_command(&create.to_string(), &state).await;
+        assert_eq!(resp.status, "error", "less than 2 options");
+    }
+
+    // ── Timeline tests ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_timeline_post_comment_delete() {
+        let state = test_state();
+
+        // Post to timeline.
+        let post = serde_json::json!({
+            "cmd": "create_post",
+            "user_id": "alice",
+            "content": "Hello from alice!",
+        });
+        let resp = handle_command(&post.to_string(), &state).await;
+        assert_eq!(resp.status, "ok", "create post");
+        let post_id = resp.data.unwrap()["post_id"].as_i64().unwrap();
+
+        // Get alice's timeline should include her own post.
+        let tl = serde_json::json!({
+            "cmd": "get_timeline",
+            "user_id": "alice",
+        });
+        let resp = handle_command(&tl.to_string(), &state).await;
+        assert_eq!(resp.status, "ok", "get timeline");
+        let posts = resp.data.unwrap()["posts"].as_array().unwrap().clone();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0]["user_id"].as_str().unwrap(), "alice");
+        assert_eq!(posts[0]["content"].as_str().unwrap(), "Hello from alice!");
+        assert_eq!(posts[0]["comment_count"].as_i64().unwrap(), 0);
+
+        // Add a comment.
+        let comment = serde_json::json!({
+            "cmd": "add_comment",
+            "post_id": post_id,
+            "user_id": "bob",
+            "content": "Hi alice!",
+        });
+        let resp = handle_command(&comment.to_string(), &state).await;
+        assert_eq!(resp.status, "ok", "add comment");
+
+        // Get comments.
+        let comments = serde_json::json!({
+            "cmd": "get_comments",
+            "post_id": post_id,
+        });
+        let resp = handle_command(&comments.to_string(), &state).await;
+        assert_eq!(resp.status, "ok", "get comments");
+        let cmts = resp.data.unwrap()["comments"].as_array().unwrap().clone();
+        assert_eq!(cmts.len(), 1);
+        assert_eq!(cmts[0]["user_id"].as_str().unwrap(), "bob");
+        assert_eq!(cmts[0]["content"].as_str().unwrap(), "Hi alice!");
+
+        // Comment count should be 1 now.
+        let resp = handle_command(&tl.to_string(), &state).await;
+        assert_eq!(resp.status, "ok");
+        assert_eq!(resp.data.unwrap()["posts"][0]["comment_count"].as_i64().unwrap(), 1);
+
+        // Delete post.
+        let del = serde_json::json!({
+            "cmd": "delete_post",
+            "post_id": post_id,
+            "user_id": "alice",
+        });
+        let resp = handle_command(&del.to_string(), &state).await;
+        assert_eq!(resp.status, "ok", "delete post");
+
+        // Timeline should be empty.
+        let resp = handle_command(&tl.to_string(), &state).await;
+        assert_eq!(resp.status, "ok");
+        assert_eq!(resp.data.unwrap()["posts"].as_array().unwrap().len(), 0);
+
+        // Comments should be gone too.
+        let resp = handle_command(&comments.to_string(), &state).await;
+        assert_eq!(resp.status, "ok");
+        assert_eq!(resp.data.unwrap()["comments"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_timeline_wall_post() {
+        let state = test_state();
+
+        // Bob posts on alice's wall.
+        let post = serde_json::json!({
+            "cmd": "create_post",
+            "user_id": "bob",
+            "content": "Hey alice!",
+            "target_user_id": "alice",
+        });
+        let resp = handle_command(&post.to_string(), &state).await;
+        assert_eq!(resp.status, "ok", "wall post");
+        let post_id = resp.data.unwrap()["post_id"].as_i64().unwrap();
+
+        // Alice should see it in her timeline.
+        let tl = serde_json::json!({
+            "cmd": "get_timeline",
+            "user_id": "alice",
+        });
+        let resp = handle_command(&tl.to_string(), &state).await;
+        assert_eq!(resp.status, "ok", "alice sees wall post");
+        let posts = resp.data.unwrap()["posts"].as_array().unwrap().clone();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0]["user_id"].as_str().unwrap(), "bob");
+        assert_eq!(posts[0]["target_user_id"].as_str().unwrap(), "alice");
+
+        // Only bob can delete his own post.
+        let del = serde_json::json!({
+            "cmd": "delete_post",
+            "post_id": post_id,
+            "user_id": "charlie",
+        });
+        let resp = handle_command(&del.to_string(), &state).await;
+        assert_eq!(resp.status, "error", "charlie cannot delete bob's post");
+    }
+
+    #[tokio::test]
+    async fn test_timeline_own_post_on_contact_timeline() {
+        let state = test_state();
+
+        // Own post (no target_user_id) appears in the user's timeline.
+        let post = serde_json::json!({
+            "cmd": "create_post",
+            "user_id": "alice",
+            "content": "My own moment",
+        });
+        let resp = handle_command(&post.to_string(), &state).await;
+        assert_eq!(resp.status, "ok");
+
+        let tl = serde_json::json!({
+            "cmd": "get_timeline",
+            "user_id": "alice",
+        });
+        let resp = handle_command(&tl.to_string(), &state).await;
+        assert_eq!(resp.status, "ok");
+        let posts = resp.data.unwrap()["posts"].as_array().unwrap().clone();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0]["content"].as_str().unwrap(), "My own moment");
+        // target_user_id should be null for own posts.
+        assert!(posts[0]["target_user_id"].is_null());
     }
 }

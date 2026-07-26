@@ -29,6 +29,7 @@ impl Store {
 
             CREATE TABLE IF NOT EXISTS messages (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_id      TEXT NOT NULL,
                 recipient_id   TEXT NOT NULL,
                 envelope       TEXT NOT NULL,
                 created_at     TEXT NOT NULL DEFAULT (datetime('now'))
@@ -36,6 +37,9 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS idx_messages_recipient
                 ON messages(recipient_id);
+
+            CREATE INDEX IF NOT EXISTS idx_messages_sender
+                ON messages(sender_id);
 
             CREATE TABLE IF NOT EXISTS groups (
                 group_id        TEXT PRIMARY KEY,
@@ -120,8 +124,9 @@ impl Store {
                 ON timeline_comments(post_id);",
         )?;
 
-        // Migration: add target_user_id column for wall posting on existing databases.
+        // Migration: add columns for existing databases.
         let _ = conn.execute_batch("ALTER TABLE timeline_posts ADD COLUMN target_user_id TEXT;");
+        let _ = conn.execute_batch("ALTER TABLE messages ADD COLUMN sender_id TEXT;");
 
         Ok(Store {
             conn: Mutex::new(conn),
@@ -466,8 +471,8 @@ impl Store {
         let envelope_json = serde_json::to_string(envelope).unwrap_or_default();
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO messages (recipient_id, envelope) VALUES (?1, ?2)",
-            params![envelope.recipient_id, envelope_json],
+            "INSERT INTO messages (sender_id, recipient_id, envelope) VALUES (?1, ?2, ?3)",
+            params![envelope.sender_id, envelope.recipient_id, envelope_json],
         )?;
         Ok(())
     }
@@ -521,8 +526,8 @@ impl Store {
                 );
                 let receipt_json = serde_json::to_string(&receipt_env).unwrap_or_default();
                 conn.execute(
-                    "INSERT INTO messages (recipient_id, envelope) VALUES (?1, ?2)",
-                    params![msg.sender_id, receipt_json],
+                    "INSERT INTO messages (sender_id, recipient_id, envelope) VALUES (?1, ?2, ?3)",
+                    params![receipt_env.sender_id, msg.sender_id, receipt_json],
                 )?;
             }
         }
@@ -703,14 +708,12 @@ impl Store {
     /// Delete a post (owner only).
     pub fn delete_post(&self, post_id: i64, user_id: &str) -> Result<bool, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
+        // Delete comments first (foreign key constraint), then the post.
+        conn.execute("DELETE FROM timeline_comments WHERE post_id = ?1", params![post_id])?;
         let affected = conn.execute(
             "DELETE FROM timeline_posts WHERE post_id = ?1 AND user_id = ?2",
             params![post_id, user_id],
         )?;
-        if affected > 0 {
-            // Also delete comments
-            conn.execute("DELETE FROM timeline_comments WHERE post_id = ?1", params![post_id])?;
-        }
         Ok(affected > 0)
     }
 
