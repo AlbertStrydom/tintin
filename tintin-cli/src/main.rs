@@ -613,6 +613,10 @@ impl TinTinClient {
                         Ok(plaintext) => {
                             self.sessions.add(new_session);
                             let is_call_signal = self.process_call_signal(&envelope.sender_id, &plaintext);
+                            if !is_call_signal {
+                                // Check for media chunks (call audio/video data)
+                                self.process_media_chunk(&envelope.sender_id, &plaintext);
+                            }
                             if !is_call_signal && !self.process_file_chunk(&envelope.sender_id, &plaintext) {
                                 Self::display_decrypted(&envelope.sender_id, &plaintext);
                                 self.record_decrypted(&envelope.sender_id, &plaintext);
@@ -1501,6 +1505,155 @@ impl TinTinClient {
         println!("📞 Call with {} ended", peer);
         self.active_call = None;
         Ok(())
+    }
+
+    /// Send encrypted media (audio) chunks during an active call.
+    async fn send_call_media(&mut self, duration_secs: u64) -> Result<(), Box<dyn std::error::Error>> {
+        let (peer, call_id, shared_secret) = match &self.active_call {
+            Some(c) if c.state == CallState::Connected => {
+                let secret = c.shared_media_secret.ok_or("Media key not established yet. Wait for the call to connect fully.")?;
+                (c.peer.clone(), c.call_id.clone(), secret)
+            }
+            Some(_) => return Err("Call is not connected yet. Use /accept first.".into()),
+            None => return Err("No active call. Use /call <user> first.".into()),
+        };
+
+        // Derive media encryption key from shared secret
+        use sha2::{Digest, Sha256};
+        let media_key: [u8; 32] = {
+            let mut hasher = Sha256::new();
+            hasher.update(&shared_secret);
+            hasher.update(b"tintin-call-media-v1");
+            let result = hasher.finalize();
+            let mut key = [0u8; 32];
+            key.copy_from_slice(&result);
+            key
+        };
+
+        println!("📡 Streaming {}s of audio to '{}'...", duration_secs, peer);
+
+        // Use the existing record_voice to capture audio
+        let path = Self::record_voice(duration_secs)?;
+        let audio_data = std::fs::read(&path)?;
+
+        // Split into ~1-second chunks and send each encrypted
+        let sample_rate = 44100u32;
+        let channels = 1u16;
+        let bytes_per_second = (sample_rate * 2 * channels as u32) as usize; // 16-bit mono
+        let chunk_size = bytes_per_second.min(audio_data.len());
+        let total_chunks = (audio_data.len() + chunk_size - 1) / chunk_size;
+
+        println!("   Splitting into {} chunks, E2E encrypted...", total_chunks);
+
+        for (seq, chunk) in audio_data.chunks(chunk_size).enumerate() {
+            // Encrypt with media key using ChaCha20-Poly1305
+            let nonce_val = seq as u64;
+            let mut nonce = [0u8; 12];
+            nonce[..8].copy_from_slice(&nonce_val.to_le_bytes());
+
+            let (ciphertext, _) = tintin_core::cipher::encrypt(chunk, &media_key)
+                .map_err(|e| format!("Encryption error: {}", e))?;
+
+            let payload = serde_json::json!({
+                "__tintin_type": "media_chunk",
+                "call_id": call_id,
+                "seq": seq,
+                "total": total_chunks,
+                "data": crate::base64_encode(&ciphertext),
+                "nonce": hex::encode(nonce),
+                "sample_rate": sample_rate,
+                "channels": channels,
+            });
+            let text = serde_json::to_string(&payload)?;
+            self.send_message(&peer, &text).await?;
+        }
+
+        // Send end-of-stream marker
+        let end_payload = serde_json::json!({
+            "__tintin_type": "media_chunk",
+            "call_id": call_id,
+            "seq": total_chunks,
+            "total": total_chunks,
+            "end_of_stream": true,
+        });
+        let end_text = serde_json::to_string(&end_payload)?;
+        self.send_message(&peer, &end_text).await?;
+
+        println!("✅ Streamed {} KB audio to '{}'", audio_data.len() / 1024, peer);
+        // Clean up temp file
+        let _ = std::fs::remove_file(&path);
+        Ok(())
+    }
+
+    /// Process an incoming media chunk (audio/video data during call).
+    fn process_media_chunk(&self, sender: &str, plaintext: &[u8]) -> bool {
+        let payload: serde_json::Value = match serde_json::from_slice(plaintext) {
+            Ok(p) => p,
+            Err(_) => return false,
+        };
+        if payload.get("__tintin_type").and_then(|v| v.as_str()) != Some("media_chunk") {
+            return false;
+        }
+
+        // Only process if we have the shared media key
+        let media_key = match self.active_call {
+            Some(ref c) if c.peer == sender => {
+                match c.shared_media_secret {
+                    Some(secret) => {
+                        use sha2::{Digest, Sha256};
+                        let mut hasher = Sha256::new();
+                        hasher.update(&secret);
+                        hasher.update(b"tintin-call-media-v1");
+                        let result = hasher.finalize();
+                        let mut key = [0u8; 32];
+                        key.copy_from_slice(&result);
+                        key
+                    }
+                    None => return false,
+                }
+            }
+            _ => return false,
+        };
+
+        let is_end = payload.get("end_of_stream").and_then(|v| v.as_bool()).unwrap_or(false);
+        if is_end {
+            println!("📡 {}: end of media stream", sender);
+            return true;
+        }
+
+        let seq = payload["seq"].as_u64().unwrap_or(0);
+        let total = payload["total"].as_u64().unwrap_or(0);
+        let data_b64 = payload["data"].as_str().unwrap_or("");
+        let nonce_hex = payload["nonce"].as_str().unwrap_or("");
+
+        if data_b64.is_empty() || nonce_hex.is_empty() {
+            return true; // This is a media_chunk but with missing data, still handled
+        }
+
+        if let Ok(ciphertext) = crate::base64_decode(data_b64) {
+            if let Ok(nonce_bytes) = hex::decode(nonce_hex) {
+                let mut nonce = [0u8; 12];
+                let copy_len = nonce.len().min(nonce_bytes.len());
+                nonce[..copy_len].copy_from_slice(&nonce_bytes[..copy_len]);
+
+                match tintin_core::cipher::decrypt(&ciphertext, &media_key, &nonce) {
+                    Ok(plaintext) => {
+                        // Save the decrypted audio chunk
+                        let dl_dir = Self::recordings_dir();
+                        let out_name = format!("call_media_{}_seq{}.raw", sender.replace(|c: char| !c.is_alphanumeric(), "_"), seq);
+                        let out_path = dl_dir.join(&out_name);
+                        let _ = std::fs::write(&out_path, &plaintext);
+                        if seq == 0 {
+                            println!("📡 Receiving media from {} ({}/{})", sender, seq + 1, total);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  Media decrypt error on seq {}: {}", seq, e);
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Process an incoming call signal (called from receive loop after decrypt).
@@ -2494,7 +2647,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  /scan <uri>               — Scan a contact QR URI");
             println!("  /call <user>                — Start an encrypted call");
             println!("  /accept <call_id>           — Accept incoming call");
-            println!("  /end                       — End/hang up current call");
+    println!("  /end                       — End/hang up current call");
+    println!("  /callstream [secs]         — Stream mic audio during a call (E2E)");
             println!("  /story <text>        — Post a status story (24h expiry)");
             println!("  /stories             — View friends' active stories");
             println!("  /clearstory          — Remove your story");
@@ -3033,6 +3187,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         if input == "/end" || input == "/hangup" {
             if let Err(e) = client.end_call("ended").await {
+                eprintln!("Error: {e}");
+            }
+            continue;
+        }
+
+        if let Some(rest) = input.strip_prefix("/callstream ") {
+            let secs: u64 = rest.trim().parse().unwrap_or(5);
+            if let Err(e) = client.send_call_media(secs).await {
+                eprintln!("Error: {e}");
+            }
+            continue;
+        }
+        if input == "/callstream" {
+            if let Err(e) = client.send_call_media(5).await {
                 eprintln!("Error: {e}");
             }
             continue;
