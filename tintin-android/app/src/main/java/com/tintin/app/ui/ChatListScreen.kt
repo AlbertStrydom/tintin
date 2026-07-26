@@ -167,10 +167,31 @@ private fun handleIncoming(appState: AppState, env: EnvelopeResponse) {
         val pt = appState.sessionManager.decryptMessage(remoteId, env.content)
         if (pt != null) {
             val text = String(pt)
-            val msg = MessageModel(
-                senderId = remoteId, text = text,
-                direction = com.tintin.app.models.MessageDirection.Incoming,
-            )
+            // Check for structured payload
+            val msg = try {
+                val json = com.google.gson.JsonParser.parseString(text).asJsonObject
+                if (json.has("__tintin_type")) {
+                    val payload = mutableMapOf<String, Any>()
+                    json.entrySet().forEach { (k, v) ->
+                        payload[k] = when { v.isJsonPrimitive -> v.asString; v.isJsonArray -> v.asJsonArray.map { it.asString }; else -> v.toString() }
+                    }
+                    val parsed = MessageModel.parseStructuredPayload(payload, remoteId)
+                    MessageModel(
+                        senderId = remoteId, text = parsed.text,
+                        direction = com.tintin.app.models.MessageDirection.Incoming,
+                        structuredType = parsed.type,
+                        groupName = parsed.groupName,
+                        channelName = parsed.channelName,
+                        pollQuestion = parsed.pollQuestion,
+                        stickerEmoji = parsed.stickerEmoji,
+                        fileName = parsed.fileName,
+                    )
+                } else {
+                    MessageModel(senderId = remoteId, text = text, direction = com.tintin.app.models.MessageDirection.Incoming)
+                }
+            } catch (_: Exception) {
+                MessageModel(senderId = remoteId, text = text, direction = com.tintin.app.models.MessageDirection.Incoming)
+            }
             appState.messages.getOrPut(remoteId) { mutableListOf() }.add(msg)
             // Ensure contact exists
             if (appState.sessionManager.contacts.none { it.id == remoteId }) {

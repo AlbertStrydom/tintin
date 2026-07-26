@@ -182,22 +182,49 @@ struct ChatListView: View {
                     appState.saveSessionJSON(updatedJSON, for: senderId)
 
                     if let text = String(data: plaintext, encoding: .utf8) {
-                        let msg = MessageModel(
-                            senderId: senderId,
-                            text: text,
-                            timestamp: Date(),
-                            direction: .incoming
-                        )
-                        await MainActor.run {
-                            // Ensure contact exists
-                            if !appState.contacts.contains(where: { $0.id == senderId }) {
-                                appState.contacts.append(
-                                    UserModel(id: senderId, identityKey: Data(), displayName: senderId)
-                                )
+                        // Check for structured payload
+                        if let payloadData = text.data(using: .utf8),
+                           let payload = try? JSONSerialization.jsonObject(with: payloadData) as? [String: Any],
+                           payload["__tintin_type"] != nil {
+                            let parsed = MessageModel.parseStructuredPayload(payload, senderId: senderId)
+                            let msg = MessageModel(
+                                senderId: senderId,
+                                text: parsed.text,
+                                timestamp: Date(),
+                                direction: .incoming,
+                                structuredType: parsed.type,
+                                groupName: parsed.groupName,
+                                channelName: parsed.channelName,
+                                pollQuestion: parsed.pollQuestion,
+                                stickerEmoji: parsed.stickerEmoji
+                            )
+                            await MainActor.run {
+                                if !appState.contacts.contains(where: { $0.id == senderId }) {
+                                    appState.contacts.append(
+                                        UserModel(id: senderId, identityKey: Data(), displayName: senderId)
+                                    )
+                                }
+                                var msgs = messages[senderId] ?? []
+                                msgs.append(msg)
+                                messages[senderId] = msgs
                             }
-                            var msgs = messages[senderId] ?? []
-                            msgs.append(msg)
-                            messages[senderId] = msgs
+                        } else {
+                            let msg = MessageModel(
+                                senderId: senderId,
+                                text: text,
+                                timestamp: Date(),
+                                direction: .incoming
+                            )
+                            await MainActor.run {
+                                if !appState.contacts.contains(where: { $0.id == senderId }) {
+                                    appState.contacts.append(
+                                        UserModel(id: senderId, identityKey: Data(), displayName: senderId)
+                                    )
+                                }
+                                var msgs = messages[senderId] ?? []
+                                msgs.append(msg)
+                                messages[senderId] = msgs
+                            }
                         }
                     }
                 } else {

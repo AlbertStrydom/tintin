@@ -96,20 +96,37 @@ fun MessageBubble(message: MessageModel) {
     val isOutgoing = message.direction == MessageDirection.Outgoing
     val bgColor = if (isOutgoing) Color(0xFF1A73E8) else MaterialTheme.colorScheme.surfaceVariant
     val textColor = if (isOutgoing) Color.White else MaterialTheme.colorScheme.onSurface
+    val shape = RoundedCornerShape(16.dp)
 
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = if (isOutgoing) Arrangement.End else Arrangement.Start,
     ) {
-        Text(
-            text = message.text,
-            color = textColor,
-            modifier = Modifier
+        if (message.stickerEmoji != null) {
+            // Sticker: show large emoji
+            Text(
+                text = message.stickerEmoji!!,
+                fontSize = MaterialTheme.typography.displaySmall.fontSize,
+                modifier = Modifier.padding(4.dp),
+            )
+        } else {
+            Column(modifier = Modifier
                 .padding(vertical = 2.dp)
-                .clip(RoundedCornerShape(16.dp))
+                .clip(shape)
                 .background(bgColor)
-                .padding(horizontal = 14.dp, vertical = 10.dp),
-        )
+                .padding(horizontal = 14.dp, vertical = 10.dp)
+            ) {
+                Text(text = message.text, color = textColor)
+                if (message.isEdited) {
+                    Text(
+                        text = "(edited)",
+                        color = if (isOutgoing) Color.White.copy(alpha = 0.7f)
+                                else Color.Gray,
+                        fontSize = MaterialTheme.typography.labelSmall.fontSize,
+                    )
+                }
+            }
+        }
     }
 }
 

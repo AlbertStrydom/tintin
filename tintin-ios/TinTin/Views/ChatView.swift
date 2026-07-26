@@ -139,15 +139,43 @@ struct MessageBubble: View {
                 Spacer(minLength: 60)
             }
 
-            Text(message.text)
-                .padding(12)
-                .background(message.direction == .outgoing ? Color.blue : Color(.systemGray5))
-                .foregroundColor(message.direction == .outgoing ? .white : .primary)
-                .cornerRadius(16)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16)
-                        .stroke(Color(.separator).opacity(0.2), lineWidth: 0.5)
-                )
+            // Choose display style based on message type
+            Group {
+                if let emoji = message.stickerEmoji {
+                    // Sticker — show large emoji
+                    Text(emoji)
+                        .font(.system(size: 48))
+                } else if let _ = message.structuredType {
+                    // Structured message — use styled text
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(message.text)
+                            .font(message.structuredType == .sticker ? .title : .body)
+                        if message.isEdited {
+                            Text("(edited)")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .padding(12)
+                    .background(message.direction == .outgoing ? Color.blue : Color(.systemGray5))
+                    .foregroundColor(message.direction == .outgoing ? .white : .primary)
+                    .cornerRadius(16)
+                } else {
+                    // Regular text message
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(message.text)
+                        if message.isEdited {
+                            Text("(edited)")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .padding(12)
+                    .background(message.direction == .outgoing ? Color.blue : Color(.systemGray5))
+                    .foregroundColor(message.direction == .outgoing ? .white : .primary)
+                    .cornerRadius(16)
+                }
+            }
 
             if message.direction == .incoming {
                 Spacer(minLength: 60)

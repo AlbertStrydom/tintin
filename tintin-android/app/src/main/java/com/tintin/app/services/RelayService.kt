@@ -124,8 +124,93 @@ class RelayService(private val host: String, private val port: Int) {
     }
 
     // ------------------------------------------------------------------
+    // Contact Discovery
+    // ------------------------------------------------------------------
+
+    suspend fun listUsers(query: String? = null): Result<List<String>> = withContext(Dispatchers.IO) {
+        try {
+            val m = mutableMapOf<String, Any>("cmd" to "list_users")
+            query?.let { m["query"] = it }
+            val resp = sendJsonGet(m as Map<String, Any>)
+            val obj = JsonParser.parseString(resp).asJsonObject
+            if (obj.get("status")?.asString != "ok") {
+                return@withContext Result.failure(Exception(obj.get("error")?.asString))
+            }
+            val users = obj.getAsJsonObject("data")?.getAsJsonArray("users")
+                ?.map { it.asString } ?: emptyList()
+            Result.success(users)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Groups
+    // ------------------------------------------------------------------
+
+    suspend fun createGroup(name: String, creator: String): Result<String> = withContext(Dispatchers.IO) {
+        try {
+            val resp = sendJsonGet(mapOf("cmd" to "create_group", "name" to name, "creator" to creator))
+            val obj = JsonParser.parseString(resp).asJsonObject
+            if (obj.get("status")?.asString != "ok") {
+                return@withContext Result.failure(Exception(obj.get("error")?.asString))
+            }
+            val gid = obj.getAsJsonObject("data")?.get("group_id")?.asString ?: ""
+            Result.success(gid)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun joinGroup(groupId: String, userId: String): Result<Unit> = sendCommand {
+        mapOf("cmd" to "join_group", "group_id" to groupId, "user_id" to userId)
+    }
+
+    suspend fun leaveGroup(groupId: String, userId: String): Result<Unit> = sendCommand {
+        mapOf("cmd" to "leave_group", "group_id" to groupId, "user_id" to userId)
+    }
+
+    // ------------------------------------------------------------------
+    // Polls
+    // ------------------------------------------------------------------
+
+    suspend fun createPoll(creator: String, question: String, options: List<String>): Result<Long> = withContext(Dispatchers.IO) {
+        try {
+            val resp = sendJsonGet(mapOf("cmd" to "create_poll", "creator" to creator, "question" to question, "options" to options))
+            val obj = JsonParser.parseString(resp).asJsonObject
+            if (obj.get("status")?.asString != "ok") {
+                return@withContext Result.failure(Exception(obj.get("error")?.asString))
+            }
+            Result.success(obj.getAsJsonObject("data")?.get("poll_id")?.asLong ?: 0)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
+    suspend fun votePoll(pollId: Long, userId: String, optionId: Long): Result<Unit> = sendCommand {
+        mapOf("cmd" to "vote_poll", "poll_id" to pollId, "user_id" to userId, "option_id" to optionId)
+    }
+
+    // ------------------------------------------------------------------
+    // Status / Stories
+    // ------------------------------------------------------------------
+
+    suspend fun setStatus(userId: String, content: String): Result<Unit> = sendCommand {
+        mapOf("cmd" to "set_status", "user_id" to userId, "content" to content)
+    }
+
+    suspend fun clearStatus(userId: String): Result<Unit> = sendCommand {
+        mapOf("cmd" to "clear_status", "user_id" to userId)
+    }
+
+    // ------------------------------------------------------------------
     // Internal helpers
     // ------------------------------------------------------------------
+
+    private fun sendJsonGet(body: Map<String, Any>): String {
+        val json = gson.toJson(body)
+        return sendJsonGet(json)
+    }
 
     private fun sendCommand(body: () -> Map<String, Any>): Result<Unit> = try {
         val json = gson.toJson(body())
@@ -149,10 +234,6 @@ class RelayService(private val host: String, private val port: Int) {
         return reader?.readLine() ?: throw Exception("No response from server")
     }
 
-    private fun sendJsonGet(body: Map<String, String>): String {
-        val json = gson.toJson(body)
-        return sendJsonGet(json)
-    }
 }
 
 data class KeyBundleResponse(

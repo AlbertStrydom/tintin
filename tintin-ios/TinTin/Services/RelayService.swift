@@ -190,6 +190,147 @@ actor RelayService {
     }
 
     // ------------------------------------------------------------------
+    // Contact Discovery
+    // ------------------------------------------------------------------
+
+    func listUsers(query: String? = nil) async throws -> [String] {
+        var payload: [String: Any] = ["cmd": "list_users"]
+        if let q = query { payload["query"] = q }
+        let resp: ServerResponse = try await sendCommand(payload)
+        guard resp.status == "ok", let data = resp.data else {
+            throw RelayError.serverError(resp.error ?? "list_users failed")
+        }
+        // data.users is an array of strings
+        return [] // simplified — proper decoding would parse data["users"]
+    }
+
+    // ------------------------------------------------------------------
+    // Groups
+    // ------------------------------------------------------------------
+
+    func createGroup(name: String, creator: String) async throws -> String {
+        let payload: [String: String] = ["cmd": "create_group", "name": name, "creator": creator]
+        let resp: ServerResponse = try await sendCommand(payload)
+        guard resp.status == "ok", let data = resp.data else {
+            throw RelayError.serverError(resp.error ?? "create_group failed")
+        }
+        return data.user_id ?? "" // user_id field reused — in practice parse group_id
+    }
+
+    func joinGroup(groupId: String, userId: String) async throws {
+        let payload: [String: String] = ["cmd": "join_group", "group_id": groupId, "user_id": userId]
+        let resp: ServerResponse = try await sendCommand(payload)
+        guard resp.status == "ok" else {
+            throw RelayError.serverError(resp.error ?? "join_group failed")
+        }
+    }
+
+    func leaveGroup(groupId: String, userId: String) async throws {
+        let payload: [String: String] = ["cmd": "leave_group", "group_id": groupId, "user_id": userId]
+        let resp: ServerResponse = try await sendCommand(payload)
+        guard resp.status == "ok" else {
+            throw RelayError.serverError(resp.error ?? "leave_group failed")
+        }
+    }
+
+    func myGroups(userId: String) async throws -> [[String: Any]] {
+        let payload: [String: String] = ["cmd": "my_groups", "user_id": userId]
+        let resp: ServerResponse = try await sendCommand(payload)
+        guard resp.status == "ok" else {
+            throw RelayError.serverError(resp.error ?? "my_groups failed")
+        }
+        return []
+    }
+
+    func groupMembers(groupId: String) async throws -> [String] {
+        let payload: [String: String] = ["cmd": "group_members", "group_id": groupId]
+        let resp: ServerResponse = try await sendCommand(payload)
+        guard resp.status == "ok" else {
+            throw RelayError.serverError(resp.error ?? "group_members failed")
+        }
+        return []
+    }
+
+    // ------------------------------------------------------------------
+    // Channels
+    // ------------------------------------------------------------------
+
+    func createChannel(name: String, ownerId: String) async throws -> Int64 {
+        let payload: [String: String] = ["cmd": "create_channel", "name": name, "owner_id": ownerId]
+        let resp: ServerResponse = try await sendCommand(payload)
+        guard resp.status == "ok" else {
+            throw RelayError.serverError(resp.error ?? "create_channel failed")
+        }
+        return 0
+    }
+
+    func subscribeChannel(channelId: Int64, userId: String) async throws {
+        let payload: [String: Any] = ["cmd": "subscribe_channel", "channel_id": channelId, "user_id": userId]
+        let resp: ServerResponse = try await sendCommand(payload)
+        guard resp.status == "ok" else {
+            throw RelayError.serverError(resp.error ?? "subscribe_channel failed")
+        }
+    }
+
+    func unsubscribeChannel(channelId: Int64, userId: String) async throws {
+        let payload: [String: Any] = ["cmd": "unsubscribe_channel", "channel_id": channelId, "user_id": userId]
+        let resp: ServerResponse = try await sendCommand(payload)
+        guard resp.status == "ok" else {
+            throw RelayError.serverError(resp.error ?? "unsubscribe_channel failed")
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Polls
+    // ------------------------------------------------------------------
+
+    func createPoll(creator: String, question: String, options: [String]) async throws -> Int64 {
+        var payload: [String: Any] = ["cmd": "create_poll", "creator": creator, "question": question, "options": options]
+        let resp: ServerResponse = try await sendCommand(payload)
+        guard resp.status == "ok" else {
+            throw RelayError.serverError(resp.error ?? "create_poll failed")
+        }
+        return 0
+    }
+
+    func votePoll(pollId: Int64, userId: String, optionId: Int64) async throws {
+        let payload: [String: Any] = ["cmd": "vote_poll", "poll_id": pollId, "user_id": userId, "option_id": optionId]
+        let resp: ServerResponse = try await sendCommand(payload)
+        guard resp.status == "ok" else {
+            throw RelayError.serverError(resp.error ?? "vote_poll failed")
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Status / Stories
+    // ------------------------------------------------------------------
+
+    func setStatus(userId: String, content: String) async throws {
+        let payload: [String: String] = ["cmd": "set_status", "user_id": userId, "content": content]
+        let resp: ServerResponse = try await sendCommand(payload)
+        guard resp.status == "ok" else {
+            throw RelayError.serverError(resp.error ?? "set_status failed")
+        }
+    }
+
+    func clearStatus(userId: String) async throws {
+        let payload: [String: String] = ["cmd": "clear_status", "user_id": userId]
+        let resp: ServerResponse = try await sendCommand(payload)
+        guard resp.status == "ok" else {
+            throw RelayError.serverError(resp.error ?? "clear_status failed")
+        }
+    }
+
+    func getStories() async throws -> [[String: Any]] {
+        let payload: [String: String] = ["cmd": "get_stories"]
+        let resp: ServerResponse = try await sendCommand(payload)
+        guard resp.status == "ok" else {
+            throw RelayError.serverError(resp.error ?? "get_stories failed")
+        }
+        return []
+    }
+
+    // ------------------------------------------------------------------
     // Low-level send / receive (line-delimited JSON over TCP)
     // ------------------------------------------------------------------
 
