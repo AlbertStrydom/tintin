@@ -31,6 +31,8 @@ struct SentMessage {
     text: String,
     timestamp: u64,
     status: MessageStatus,
+    #[serde(default)]
+    edited: bool,
 }
 
 /// A group we belong to.
@@ -261,9 +263,88 @@ impl TinTinClient {
             text: plaintext.to_string(),
             timestamp: envelope.timestamp,
             status: MessageStatus::Sent,
+            edited: false,
         });
         self.save_history();
         println!("✓ Sent to '{}' (✓)", recipient);
+        Ok(())
+    }
+
+    /// Edit a previously sent message by index.
+    async fn edit_message(&mut self, index: usize, new_text: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(msg) = self.sent_messages.get(index) else {
+            return Err(format!("Message #{} not found (you have {} messages)", index, self.sent_messages.len()).into());
+        };
+
+        let recipient = msg.recipient.clone();
+        let original_timestamp = msg.timestamp;
+        let is_group = recipient.starts_with('[');
+
+        // Build the edit payload.
+        let payload = serde_json::json!({
+            "__tintin_type": "edit",
+            "original_timestamp": original_timestamp,
+            "new_text": new_text,
+        });
+        let payload_bytes = serde_json::to_vec(&payload)?;
+
+        if recipient == self.user_id {
+            // Self-message: send as plaintext.
+            let env = Envelope::new(
+                self.user_id.clone(),
+                self.user_id.clone(),
+                new_text.as_bytes().to_vec(),
+                MessageType::Normal,
+            );
+            let req = serde_json::json!({"cmd": "send", "envelope": env});
+            self.send_json(&req).await?;
+            let _ = self.recv_json().await;
+        } else if is_group {
+            // Extract group_id from recipient format "[name] id"
+            let gid = recipient.split(' ').last().unwrap_or(&recipient);
+            let members = self.group_members(gid).await?;
+            for member in &members {
+                if member == &self.user_id {
+                    continue;
+                }
+                if let Some(session) = self.sessions.get_mut(member, 1) {
+                    let encrypted = session.encrypt(&payload_bytes)?;
+                    let content = encrypted.to_json()?;
+                    let env = Envelope::new(
+                        self.user_id.clone(),
+                        member.to_string(),
+                        content,
+                        MessageType::Normal,
+                    );
+                    let req = serde_json::json!({"cmd": "send", "envelope": env});
+                    self.send_json(&req).await?;
+                    let _ = self.recv_json().await;
+                }
+            }
+        } else {
+            // Private edit: send to the one recipient.
+            if let Some(session) = self.sessions.get_mut(&recipient, 1) {
+                let encrypted = session.encrypt(&payload_bytes)?;
+                let content = encrypted.to_json()?;
+                let env = Envelope::new(
+                    self.user_id.clone(),
+                    recipient.clone(),
+                    content,
+                    MessageType::Normal,
+                );
+                let req = serde_json::json!({"cmd": "send", "envelope": env});
+                self.send_json(&req).await?;
+                let _ = self.recv_json().await;
+            }
+        }
+
+        // Update local tracking.
+        if let Some(msg) = self.sent_messages.get_mut(index) {
+            msg.text = new_text.to_string();
+            msg.edited = true;
+        }
+        self.save_history();
+        println!("✏️ Message #{} edited", index);
         Ok(())
     }
 
@@ -752,6 +833,7 @@ impl TinTinClient {
                 .unwrap_or_default()
                 .as_millis() as u64,
             status: MessageStatus::Sent,
+            edited: false,
         });
         self.save_history();
         println!("✓ Sent to group '{}' ({} members)", group_name, others.len());
@@ -763,15 +845,20 @@ impl TinTinClient {
         // Check for TinTin structured message (group chat, etc.)
         if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(plaintext) {
             if let Some(tt_type) = payload.get("__tintin_type").and_then(|v| v.as_str()) {
-                match tt_type {
-                    "group" => {
-                        let gname = payload["group_name"].as_str().unwrap_or("Group");
-                        let text = payload["text"].as_str().unwrap_or("");
-                        println!("[{}] {}: {}", gname, sender, text);
-                        return;
-                    }
-                    _ => {}
+            match tt_type {
+                "group" => {
+                    let gname = payload["group_name"].as_str().unwrap_or("Group");
+                    let text = payload["text"].as_str().unwrap_or("");
+                    println!("[{}] {}: {}", gname, sender, text);
+                    return;
                 }
+                "edit" => {
+                    let new_text = payload["new_text"].as_str().unwrap_or("");
+                    println!("✏️ {} edited: {}", sender, new_text);
+                    return;
+                }
+                _ => {}
+            }
             }
         }
         // Regular message.
@@ -826,6 +913,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  /group join id      — Join an existing group");
     println!("  /group leave id     — Leave a group");
     println!("  /group send id text — Send to a group");
+    println!("  /edit <idx> text    — Edit a sent message (see /status for index)");
     println!("  /status             — Show sent message status (✓/✓✓)");
     println!("  /help               — Show this help");
     println!("  /quit               — Exit");
@@ -863,6 +951,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  /group join id      — Join a group");
             println!("  /group leave id     — Leave a group");
             println!("  /group send id text — Send to a group");
+            println!("  /edit <idx> text    — Edit a sent message");
             println!("  /status             — Show sent message status (✓/✓✓)");
             println!("  /help               — Show this help");
             println!("  /quit               — Exit");
@@ -881,13 +970,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if sent.is_empty() {
                 println!("No sent messages yet.");
             } else {
-                for msg in sent {
+                for (i, msg) in sent.iter().enumerate() {
                     let status = match msg.status {
                         MessageStatus::Sent => "✓",
                         MessageStatus::Delivered => "✓✓",
                         MessageStatus::Read => "✓✓",
                     };
-                    println!("  {status} {} → {} ({})", msg.text, msg.recipient, status);
+                    let edited = if msg.edited { " (edited)" } else { "" };
+                    println!("  #{i} {status} {} → {}{}", msg.text, msg.recipient, edited);
                 }
             }
             continue;
@@ -925,6 +1015,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 Err(e) => eprintln!("Error: {e}"),
+            }
+            continue;
+        }
+
+        if let Some(rest) = input.strip_prefix("/edit ") {
+            // /edit <index> <new text>
+            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
+            if parts.len() < 2 {
+                eprintln!("Usage: /edit <index> <new text>");
+                eprintln!("  Get the index from /status");
+                continue;
+            }
+            let index: usize = match parts[0].parse() {
+                Ok(i) => i,
+                Err(_) => {
+                    eprintln!("Invalid index. Use /status to see message numbers.");
+                    continue;
+                }
+            };
+            let new_text = parts[1];
+            if let Err(e) = client.edit_message(index, new_text).await {
+                eprintln!("Error: {e}");
             }
             continue;
         }
