@@ -58,7 +58,23 @@ impl Store {
                 user_id         TEXT PRIMARY KEY,
                 content         TEXT NOT NULL,
                 created_at      INTEGER NOT NULL
-            );",
+            );
+
+            CREATE TABLE IF NOT EXISTS channels (
+                channel_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                name            TEXT NOT NULL,
+                owner_id        TEXT NOT NULL,
+                created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS channel_subscribers (
+                channel_id      INTEGER NOT NULL REFERENCES channels(channel_id),
+                user_id         TEXT NOT NULL,
+                PRIMARY KEY (channel_id, user_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_channel_subscribers_user
+                ON channel_subscribers(user_id);",
         )?;
 
         Ok(Store {
@@ -189,6 +205,121 @@ impl Store {
         let mut stmt = conn.prepare("SELECT COUNT(*) FROM groups WHERE group_id = ?1")?;
         let count: i64 = stmt.query_row(params![group_id], |row| row.get(0))?;
         Ok(count > 0)
+    }
+
+    // ── Channels ──────────────────────────────────────────────
+
+    /// Create a new channel. Returns the generated channel_id.
+    pub fn create_channel(
+        &self,
+        name: &str,
+        owner_id: &str,
+    ) -> Result<i64, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO channels (name, owner_id) VALUES (?1, ?2)",
+            params![name, owner_id],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Subscribe a user to a channel.
+    pub fn subscribe_channel(
+        &self,
+        channel_id: i64,
+        user_id: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO channel_subscribers (channel_id, user_id) VALUES (?1, ?2)",
+            params![channel_id, user_id],
+        )?;
+        Ok(())
+    }
+
+    /// Unsubscribe a user from a channel.
+    pub fn unsubscribe_channel(
+        &self,
+        channel_id: i64,
+        user_id: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM channel_subscribers WHERE channel_id = ?1 AND user_id = ?2",
+            params![channel_id, user_id],
+        )?;
+        Ok(())
+    }
+
+    /// Check if a channel exists and return its owner.
+    pub fn get_channel_owner(&self, channel_id: i64) -> Result<Option<String>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT owner_id FROM channels WHERE channel_id = ?1")?;
+        let mut rows = stmt.query(params![channel_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// List all subscribers of a channel.
+    pub fn list_channel_subscribers(
+        &self,
+        channel_id: i64,
+    ) -> Result<Vec<String>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT user_id FROM channel_subscribers WHERE channel_id = ?1 ORDER BY user_id",
+        )?;
+        let users = stmt.query_map(params![channel_id], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(users)
+    }
+
+    /// List all channels a user is subscribed to.
+    pub fn list_my_channels(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<serde_json::Value>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT c.channel_id, c.name, c.owner_id
+             FROM channels c
+             JOIN channel_subscribers cs ON c.channel_id = cs.channel_id
+             WHERE cs.user_id = ?1
+             ORDER BY c.name",
+        )?;
+        let rows = stmt
+            .query_map(params![user_id], |row| {
+                Ok(serde_json::json!({
+                    "channel_id": row.get::<_, i64>(0)?,
+                    "name": row.get::<_, String>(1)?,
+                    "owner_id": row.get::<_, String>(2)?,
+                }))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// List all channels (for discovery).
+    pub fn list_all_channels(&self) -> Result<Vec<serde_json::Value>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT channel_id, name, owner_id FROM channels ORDER BY name",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(serde_json::json!({
+                    "channel_id": row.get::<_, i64>(0)?,
+                    "name": row.get::<_, String>(1)?,
+                    "owner_id": row.get::<_, String>(2)?,
+                }))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
     }
 
     // ── Status / Stories ───────────────────────────────────────

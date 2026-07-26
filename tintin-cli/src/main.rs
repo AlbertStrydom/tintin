@@ -51,6 +51,10 @@ struct MessageRecord {
     direction: MessageDirection,
     is_group: bool,
     group_name: Option<String>,
+    #[serde(default)]
+    is_channel: bool,
+    #[serde(default)]
+    channel_name: Option<String>,
     edited: bool,
 }
 
@@ -94,6 +98,8 @@ struct TinTinClient {
     chat_log: Vec<MessageRecord>,
     /// Incoming file transfers being assembled.
     pending_files: HashMap<String, PendingFile>,
+    /// Channels we're subscribed to (channel_id -> name).
+    channels: HashMap<i64, String>,
 }
 
 impl TinTinClient {
@@ -113,9 +119,11 @@ impl TinTinClient {
             groups: HashMap::new(),
             chat_log: Vec::new(),
             pending_files: HashMap::new(),
+            channels: HashMap::new(),
         };
         client.load_history();
         client.load_groups();
+        client.load_channels();
         client.load_chat_log();
         client
     }
@@ -192,6 +200,36 @@ impl TinTinClient {
         }
     }
 
+    // ── Channels persistence ────────────────────────────────────
+
+    fn channels_path(&self) -> PathBuf {
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_else(|_| ".".to_string());
+        let dir = PathBuf::from(home).join(".tintin");
+        let _ = std::fs::create_dir_all(&dir);
+        dir.join(format!("{}_channels.json", self.user_id))
+    }
+
+    fn load_channels(&mut self) {
+        let path = self.channels_path();
+        if !path.exists() {
+            return;
+        }
+        if let Ok(json) = std::fs::read_to_string(&path) {
+            if let Ok(chs) = serde_json::from_str::<HashMap<i64, String>>(&json) {
+                self.channels = chs;
+            }
+        }
+    }
+
+    fn save_channels(&self) {
+        let path = self.channels_path();
+        if let Ok(json) = serde_json::to_string_pretty(&self.channels) {
+            let _ = std::fs::write(&path, &json);
+        }
+    }
+
     // ── Chat log persistence ────────────────────────────────────
 
     fn chat_log_path(&self) -> PathBuf {
@@ -223,7 +261,7 @@ impl TinTinClient {
     }
 
     /// Append a message to the chat log and persist.
-    fn record_message(&mut self, peer: &str, text: &str, outgoing: bool, is_group: bool, group_name: Option<String>) {
+    fn record_message(&mut self, peer: &str, text: &str, outgoing: bool, is_group: bool, group_name: Option<String>, is_channel: bool, channel_name: Option<String>) {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -235,6 +273,8 @@ impl TinTinClient {
             direction: if outgoing { MessageDirection::Outgoing } else { MessageDirection::Incoming },
             is_group,
             group_name,
+            is_channel,
+            channel_name,
             edited: false,
         });
         self.save_chat_log();
@@ -349,7 +389,7 @@ impl TinTinClient {
             edited: false,
         });
         self.save_history();
-        self.record_message(recipient, plaintext, true, false, None);
+        self.record_message(recipient, plaintext, true, false, None, false, None);
         println!("✓ Sent to '{}' (✓)", recipient);
         Ok(())
     }
@@ -568,7 +608,7 @@ impl TinTinClient {
                         let text = String::from_utf8_lossy(&envelope.content);
                         println!("📝 Saved: {}", text);
                         let my_id = self.user_id.clone();
-                        self.record_message(&my_id, &text, false, false, None);
+                        self.record_message(&my_id, &text, false, false, None, false, None);
                         continue;
                     }
 
@@ -935,8 +975,216 @@ impl TinTinClient {
             edited: false,
         });
         self.save_history();
-        self.record_message(&group_name, plaintext, true, true, Some(group_name.clone()));
+        self.record_message(&group_name, plaintext, true, true, Some(group_name.clone()), false, None);
         println!("✓ Sent to group '{}' ({} members)", group_name, others.len());
+        Ok(())
+    }
+
+    // ── Channel methods ────────────────────────────────────────
+
+    /// Create a new channel. Returns the channel_id.
+    async fn create_channel(&mut self, name: &str) -> Result<i64, Box<dyn std::error::Error>> {
+        let request = serde_json::json!({
+            "cmd": "create_channel",
+            "name": name,
+            "owner_id": self.user_id,
+        });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed to create channel: {}", resp["error"]).into());
+        }
+        let channel_id = resp["data"]["channel_id"].as_i64().unwrap_or(0);
+        // Update local cache.
+        self.channels.insert(channel_id, name.to_string());
+        self.save_channels();
+        Ok(channel_id)
+    }
+
+    /// Subscribe to a channel.
+    async fn subscribe_channel(&mut self, channel_id: i64) -> Result<(), Box<dyn std::error::Error>> {
+        let request = serde_json::json!({
+            "cmd": "subscribe_channel",
+            "channel_id": channel_id,
+            "user_id": self.user_id,
+        });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed to subscribe: {}", resp["error"]).into());
+        }
+        // Update local cache.
+        self.channels.insert(channel_id, format!("ch{}", channel_id));
+        self.save_channels();
+        Ok(())
+    }
+
+    /// Unsubscribe from a channel.
+    async fn unsubscribe_channel(&mut self, channel_id: i64) -> Result<(), Box<dyn std::error::Error>> {
+        let request = serde_json::json!({
+            "cmd": "unsubscribe_channel",
+            "channel_id": channel_id,
+            "user_id": self.user_id,
+        });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed to unsubscribe: {}", resp["error"]).into());
+        }
+        self.channels.remove(&channel_id);
+        self.save_channels();
+        Ok(())
+    }
+
+    /// List all channels on the server.
+    async fn list_all_channels(&self) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        let request = serde_json::json!({ "cmd": "list_channels" });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed to list channels: {}", resp["error"]).into());
+        }
+        Ok(resp["data"]["channels"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// List channels I'm subscribed to.
+    async fn list_my_channels(&mut self) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error>> {
+        let request = serde_json::json!({
+            "cmd": "my_channels",
+            "user_id": self.user_id,
+        });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed to list my channels: {}", resp["error"]).into());
+        }
+        let channels = resp["data"]["channels"].as_array().cloned().unwrap_or_default();
+        // Update local cache.
+        for ch in &channels {
+            if let (Some(cid), Some(name)) = (ch["channel_id"].as_i64(), ch["name"].as_str()) {
+                self.channels.insert(cid, name.to_string());
+            }
+        }
+        self.save_channels();
+        Ok(channels)
+    }
+
+    /// Get subscriber list for a channel.
+    async fn channel_members(&self, channel_id: i64) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let request = serde_json::json!({
+            "cmd": "channel_members",
+            "channel_id": channel_id,
+        });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed to get channel members: {}", resp["error"]).into());
+        }
+        let members: Vec<String> = resp["data"]["members"]
+            .as_array()
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        Ok(members)
+    }
+
+    /// Send a message to a channel — encrypts once per subscriber.
+    async fn send_channel_message(
+        &mut self,
+        channel_id: i64,
+        plaintext: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let channel_name = self
+            .channels
+            .get(&channel_id)
+            .cloned()
+            .unwrap_or_else(|| format!("ch{}", channel_id));
+
+        let members = self.channel_members(channel_id).await?;
+        let others: Vec<&str> = members
+            .iter()
+            .filter(|m| *m != &self.user_id)
+            .map(|m| m.as_str())
+            .collect();
+
+        if others.is_empty() {
+            // Only us — save locally.
+            println!("📢 [{}] you: {} (no other subscribers)", channel_name, plaintext);
+            return Ok(());
+        }
+
+        // Build the channel-tagged payload.
+        let payload = serde_json::json!({
+            "__tintin_type": "channel",
+            "channel_id": channel_id,
+            "channel_name": channel_name,
+            "text": plaintext,
+        });
+        let payload_bytes = serde_json::to_vec(&payload)?;
+
+        // Send to each subscriber encrypted with their session.
+        for member in &others {
+            let is_new = self.sessions.get_mut(member, 1).is_none();
+            if is_new {
+                let bundle = self.fetch_bundle(member).await?;
+                let new_session = Session::new_initiator(
+                    IdentityKeyPair {
+                        key_pair: KeyPair {
+                            secret: self.identity.key_pair.secret,
+                            public: self.identity.key_pair.public,
+                        },
+                    },
+                    member.to_string(),
+                    1,
+                    bundle.identity_key,
+                    &bundle.signed_pre_key,
+                )?;
+                self.sessions.add(new_session);
+            }
+
+            let session = self.sessions.get_mut(member, 1).unwrap();
+            let encrypted = session.encrypt(&payload_bytes)?;
+
+            let (content, msg_type) = if is_new {
+                let prekey = PreKeyBundleMessage {
+                    identity_key: *self.identity.public_key(),
+                    base_key: session.ratchet.dh_ratchet_key.public,
+                    session_message: encrypted,
+                };
+                (serde_json::to_vec(&prekey)?, MessageType::PreKeyBundle)
+            } else {
+                (encrypted.to_json()?, MessageType::Normal)
+            };
+
+            let envelope = Envelope::new(
+                self.user_id.clone(),
+                member.to_string(),
+                content,
+                msg_type,
+            );
+            let request = serde_json::json!({ "cmd": "send", "envelope": envelope });
+            self.send_json(&request).await?;
+            let resp = self.recv_json().await?;
+            if resp["status"] != "ok" {
+                eprintln!("  ⚠️  Failed to send to {}: {}", member, resp["error"]);
+            }
+        }
+
+        // Track in sent messages.
+        self.sent_messages.push(SentMessage {
+            recipient: format!("[{}] ch{}", channel_name, channel_id),
+            text: plaintext.to_string(),
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64,
+            status: MessageStatus::Sent,
+            edited: false,
+        });
+        self.save_history();
+        self.record_message(&channel_name, plaintext, true, false, None, true, Some(channel_name.clone()));
+        println!("✓ Sent to channel '{}' ({} subscribers)", channel_name, others.len());
         Ok(())
     }
 
@@ -950,6 +1198,12 @@ impl TinTinClient {
                     let gname = payload["group_name"].as_str().unwrap_or("Group");
                     let text = payload["text"].as_str().unwrap_or("");
                     println!("[{}] {}: {}", gname, sender, text);
+                    return;
+                }
+                "channel" => {
+                    let cname = payload["channel_name"].as_str().unwrap_or("Channel");
+                    let text = payload["text"].as_str().unwrap_or("");
+                    println!("📢 [{}] {}: {}", cname, sender, text);
                     return;
                 }
                 "edit" => {
@@ -968,18 +1222,22 @@ impl TinTinClient {
 
     /// Record a decrypted message in the chat log.
     fn record_decrypted(&mut self, sender: &str, plaintext: &[u8]) {
-        let (text, is_group, group_name) = if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(plaintext) {
+        let (text, is_group, group_name, is_channel, channel_name) = if let Ok(payload) = serde_json::from_slice::<serde_json::Value>(plaintext) {
             if payload.get("__tintin_type").and_then(|v| v.as_str()) == Some("group") {
                 let t = payload["text"].as_str().unwrap_or("").to_string();
                 let gn = payload["group_name"].as_str().unwrap_or("Group").to_string();
-                (t, true, Some(gn))
+                (t, true, Some(gn), false, None)
+            } else if payload.get("__tintin_type").and_then(|v| v.as_str()) == Some("channel") {
+                let t = payload["text"].as_str().unwrap_or("").to_string();
+                let cn = payload["channel_name"].as_str().unwrap_or("Channel").to_string();
+                (t, false, None, true, Some(cn))
             } else {
-                (String::from_utf8_lossy(plaintext).to_string(), false, None)
+                (String::from_utf8_lossy(plaintext).to_string(), false, None, false, None)
             }
         } else {
-            (String::from_utf8_lossy(plaintext).to_string(), false, None)
+            (String::from_utf8_lossy(plaintext).to_string(), false, None, false, None)
         };
-        self.record_message(sender, &text, false, is_group, group_name);
+        self.record_message(sender, &text, false, is_group, group_name, is_channel, channel_name);
     }
 
     // ── Status / Stories ───────────────────────────────────────
@@ -1278,6 +1536,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  /edit <idx> text    — Edit a sent message (see /status for index)");
     println!("  /search <text>       — Search message history");
     println!("  /sendfile <user> <path> — Send a file (E2E encrypted, chunked)");
+    println!("  /channel create <name>  — Create a broadcast channel");
+    println!("  /channel sub <id>       — Subscribe to a channel");
+    println!("  /channel unsub <id>     — Unsubscribe from a channel");
+    println!("  /channel send <id> <t>  — Send to a channel (owner only)");
+    println!("  /channels              — List all available channels");
+    println!("  /my_channels           — List your channel subscriptions");
     println!("  /story <text>        — Post a status story (24h expiry)");
     println!("  /stories             — View friends' active stories");
     println!("  /clearstory          — Remove your story");
@@ -1321,6 +1585,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  /edit <idx> text    — Edit a sent message");
             println!("  /search <text>       — Search message history");
             println!("  /sendfile <user> <path> — Send a file (E2E encrypted, chunked)");
+            println!("  /channel create <name>  — Create a broadcast channel");
+            println!("  /channel sub <id>       — Subscribe to a channel");
+            println!("  /channel unsub <id>     — Unsubscribe from a channel");
+            println!("  /channel send <id> <t>  — Send to a channel (owner only)");
+            println!("  /channels              — List all available channels");
+            println!("  /my_channels           — List your channel subscriptions");
             println!("  /story <text>        — Post a status story (24h expiry)");
             println!("  /stories             — View friends' active stories");
             println!("  /clearstory          — Remove your story");
@@ -1548,6 +1818,115 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("Unknown group command: {subcmd}");
                     eprintln!("Available: create, join, leave, send");
                 }
+            }
+            continue;
+        }
+
+        if let Some(rest) = input.strip_prefix("/channel ") {
+            let parts: Vec<&str> = rest.splitn(3, ' ').collect();
+            if parts.is_empty() {
+                eprintln!("Usage:");
+                eprintln!("  /channel create <name>");
+                eprintln!("  /channel sub <channel_id>");
+                eprintln!("  /channel unsub <channel_id>");
+                eprintln!("  /channel send <channel_id> <text>");
+                eprintln!("  /channels                   — List all channels");
+                eprintln!("  /my_channels                — List my subscriptions");
+                continue;
+            }
+            let subcmd = parts[0];
+            match subcmd {
+                "create" => {
+                    if parts.len() < 2 {
+                        eprintln!("Usage: /channel create <name>");
+                        continue;
+                    }
+                    match client.create_channel(parts[1]).await {
+                        Ok(id) => println!("✓ Channel '{}' created (id: {})", parts[1], id),
+                        Err(e) => eprintln!("Error: {e}"),
+                    }
+                }
+                "sub" | "subscribe" => {
+                    if parts.len() < 2 {
+                        eprintln!("Usage: /channel sub <channel_id>");
+                        continue;
+                    }
+                    let cid: i64 = match parts[1].parse() {
+                        Ok(id) => id,
+                        Err(_) => { eprintln!("Invalid channel id"); continue; }
+                    };
+                    match client.subscribe_channel(cid).await {
+                        Ok(()) => println!("✓ Subscribed to channel {}", cid),
+                        Err(e) => eprintln!("Error: {e}"),
+                    }
+                }
+                "unsub" | "unsubscribe" => {
+                    if parts.len() < 2 {
+                        eprintln!("Usage: /channel unsub <channel_id>");
+                        continue;
+                    }
+                    let cid: i64 = match parts[1].parse() {
+                        Ok(id) => id,
+                        Err(_) => { eprintln!("Invalid channel id"); continue; }
+                    };
+                    match client.unsubscribe_channel(cid).await {
+                        Ok(()) => println!("✓ Unsubscribed from channel {}", cid),
+                        Err(e) => eprintln!("Error: {e}"),
+                    }
+                }
+                "send" => {
+                    if parts.len() < 3 {
+                        eprintln!("Usage: /channel send <channel_id> <text>");
+                        continue;
+                    }
+                    let cid: i64 = match parts[1].parse() {
+                        Ok(id) => id,
+                        Err(_) => { eprintln!("Invalid channel id"); continue; }
+                    };
+                    let text = parts[2];
+                    match client.send_channel_message(cid, text).await {
+                        Ok(()) => {}
+                        Err(e) => eprintln!("Error: {e}"),
+                    }
+                }
+                _ => {
+                    eprintln!("Unknown channel command: {subcmd}");
+                    eprintln!("Available: create, sub, unsub, send");
+                }
+            }
+            continue;
+        }
+
+        if input == "/channels" || input == "/list_channels" {
+            match client.list_all_channels().await {
+                Ok(chs) => {
+                    if chs.is_empty() {
+                        println!("No channels exist yet. Create one with /channel create <name>");
+                    } else {
+                        println!("All channels:");
+                        for ch in &chs {
+                            println!("  {} — {} (owner: {})", ch["channel_id"], ch["name"], ch["owner_id"]);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Error: {e}"),
+            }
+            continue;
+        }
+
+        if input == "/my_channels" || input == "/mychnl" {
+            match client.list_my_channels().await {
+                Ok(chs) => {
+                    if chs.is_empty() {
+                        println!("You're not subscribed to any channels.");
+                    } else {
+                        println!("My channels:");
+                        for ch in &chs {
+                            println!("  {} — {} (owner: {})", ch["channel_id"], ch["name"], ch["owner_id"]);
+                        }
+                    }
+                }
+                Err(e) => eprintln!("Error: {e}"),
             }
             continue;
         }

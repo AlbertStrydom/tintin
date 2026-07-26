@@ -191,6 +191,39 @@ struct ClearStatusCmd {
     user_id: String,
 }
 
+// ── Channel commands ────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct CreateChannelCmd {
+    cmd: String,
+    name: String,
+    owner_id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct SubscribeChannelCmd {
+    cmd: String,
+    channel_id: i64,
+    user_id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct UnsubscribeChannelCmd {
+    cmd: String,
+    channel_id: i64,
+    user_id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct ChannelMembersCmd {
+    cmd: String,
+    channel_id: i64,
+}
+
 async fn handle_command(line: &str, state: &AppState) -> ServerResponse {
     let value: serde_json::Value = match serde_json::from_str(line) {
         Ok(v) => v,
@@ -228,6 +261,12 @@ async fn handle_command(line: &str, state: &AppState) -> ServerResponse {
         "set_status" => handle_set_status(&value, state).await,
         "clear_status" => handle_clear_status(&value, state).await,
         "get_stories" => handle_get_stories(&value, state).await,
+        "create_channel" => handle_create_channel(&value, state).await,
+        "subscribe_channel" => handle_subscribe_channel(&value, state).await,
+        "unsubscribe_channel" => handle_unsubscribe_channel(&value, state).await,
+        "list_channels" => handle_list_channels(&value, state).await,
+        "my_channels" => handle_my_channels(&value, state).await,
+        "channel_members" => handle_channel_members(&value, state).await,
         _ => ServerResponse {
             status: "error".to_string(),
             data: None,
@@ -603,6 +642,173 @@ async fn handle_get_stories(_value: &serde_json::Value, state: &AppState) -> Ser
             ServerResponse {
                 status: "ok".to_string(),
                 data: Some(serde_json::json!({"stories": statuses})),
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+// ── Channel handlers ──────────────────────────────────────────
+
+async fn handle_create_channel(value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    let cmd: CreateChannelCmd = match serde_json::from_value(value.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return ServerResponse {
+                status: "error".to_string(),
+                data: None,
+                error: Some(format!("Invalid payload: {e}")),
+            }
+        }
+    };
+    match state.store.create_channel(&cmd.name, &cmd.owner_id) {
+        Ok(channel_id) => {
+            // Auto-subscribe the owner.
+            state.store.subscribe_channel(channel_id, &cmd.owner_id).ok();
+            eprintln!("  📢 Channel '{}' created (id={})", cmd.name, channel_id);
+            ServerResponse {
+                status: "ok".to_string(),
+                data: Some(serde_json::json!({"channel_id": channel_id})),
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+async fn handle_subscribe_channel(value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    let cmd: SubscribeChannelCmd = match serde_json::from_value(value.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return ServerResponse {
+                status: "error".to_string(),
+                data: None,
+                error: Some(format!("Invalid payload: {e}")),
+            }
+        }
+    };
+    // Verify channel exists.
+    if state.store.get_channel_owner(cmd.channel_id).unwrap_or(None).is_none() {
+        return ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Channel '{}' not found", cmd.channel_id)),
+        };
+    }
+    match state.store.subscribe_channel(cmd.channel_id, &cmd.user_id) {
+        Ok(()) => {
+            eprintln!("  👤 {} subscribed to channel {}", cmd.user_id, cmd.channel_id);
+            ServerResponse {
+                status: "ok".to_string(),
+                data: None,
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+async fn handle_unsubscribe_channel(value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    let cmd: UnsubscribeChannelCmd = match serde_json::from_value(value.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return ServerResponse {
+                status: "error".to_string(),
+                data: None,
+                error: Some(format!("Invalid payload: {e}")),
+            }
+        }
+    };
+    match state.store.unsubscribe_channel(cmd.channel_id, &cmd.user_id) {
+        Ok(()) => {
+            eprintln!("  👤 {} unsubscribed from channel {}", cmd.user_id, cmd.channel_id);
+            ServerResponse {
+                status: "ok".to_string(),
+                data: None,
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+async fn handle_list_channels(_value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    match state.store.list_all_channels() {
+        Ok(channels) => {
+            ServerResponse {
+                status: "ok".to_string(),
+                data: Some(serde_json::json!({"channels": channels})),
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+async fn handle_my_channels(value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    let cmd: SubscribeChannelCmd = match serde_json::from_value(value.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return ServerResponse {
+                status: "error".to_string(),
+                data: None,
+                error: Some(format!("Invalid payload: {e}")),
+            }
+        }
+    };
+    match state.store.list_my_channels(&cmd.user_id) {
+        Ok(channels) => {
+            ServerResponse {
+                status: "ok".to_string(),
+                data: Some(serde_json::json!({"channels": channels})),
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+async fn handle_channel_members(value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    let cmd: ChannelMembersCmd = match serde_json::from_value(value.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return ServerResponse {
+                status: "error".to_string(),
+                data: None,
+                error: Some(format!("Invalid payload: {e}")),
+            }
+        }
+    };
+    match state.store.list_channel_subscribers(cmd.channel_id) {
+        Ok(members) => {
+            ServerResponse {
+                status: "ok".to_string(),
+                data: Some(serde_json::json!({"members": members})),
                 error: None,
             }
         }
