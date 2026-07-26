@@ -28,3 +28,4 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 base64 = "0.22"
 qrcode = "0.14"
 image = "0.25"
+cpal = "0.15"

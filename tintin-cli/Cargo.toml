@@ -17,3 +17,4 @@ rand.workspace = true
 base64.workspace = true
 qrcode.workspace = true
 image.workspace = true
+cpal.workspace = true

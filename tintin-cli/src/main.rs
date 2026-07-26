@@ -11,6 +11,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+
 use tintin_core::{
     Envelope, IdentityKeyPair, KeyPair, MessageType, PreKeyBundleMessage, ReceiptContent,
     ReceiptType, Session, SessionMessage, SessionStore, SignedPreKey,
@@ -1686,6 +1688,152 @@ impl TinTinClient {
         Ok(())
     }
 
+    // ── Voice Note Recording ─────────────────────────────────
+
+    /// Directory for voice recordings.
+    fn recordings_dir() -> PathBuf {
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_else(|_| ".".to_string());
+        let dir = PathBuf::from(home).join(".tintin").join("recordings");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// Record audio from the default microphone and save as WAV.
+    fn record_voice(duration_secs: u64) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let host = cpal::default_host();
+        let device = host
+            .default_input_device()
+            .ok_or("No input device found. Plug in a microphone.")?;
+
+        let config = device.default_input_config()?;
+        let sample_format = config.sample_format();
+        let channels = config.channels();
+        let sample_rate = config.sample_rate().0;
+
+        println!("🎤 Recording from: {} ({} Hz, {} ch, {})",
+            device.name()?, sample_rate, channels, sample_format);
+        println!("   Recording for {} seconds... Press Ctrl+C to stop early.", duration_secs);
+        print!("   [");
+        io::stdout().flush()?;
+
+        // We use a channel to receive audio samples from the callback.
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(64);
+
+        let err_fn = |err| eprintln!("Audio error: {}", err);
+        let stream = device.build_input_stream::<f32, _, _>(
+            &config.config(),
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                let chunk = data.to_vec();
+                let _ = tx.send(chunk);
+            },
+            err_fn,
+            None,
+        )?;
+        stream.play()?;
+
+        // Record samples for the given duration (or until Ctrl+C).
+        let start = std::time::Instant::now();
+        let duration = std::time::Duration::from_secs(duration_secs);
+        let mut all_samples: Vec<f32> = Vec::new();
+        let mut progress_ticks = 0usize;
+
+        loop {
+            // Non-blocking check for Ctrl+C
+            if start.elapsed() >= duration {
+                break;
+            }
+            match rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(chunk) => {
+                    all_samples.extend(chunk);
+                    let elapsed = start.elapsed().as_secs();
+                    let expected_ticks = (elapsed as usize).min(duration_secs as usize);
+                    while progress_ticks < expected_ticks {
+                        print!("█");
+                        io::stdout().flush()?;
+                        progress_ticks += 1;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // Just continue checking
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        stream.pause()?;
+        println!("]");
+
+        let total_samples = all_samples.len();
+        let actual_duration = if sample_rate > 0 {
+            total_samples as f64 / (sample_rate as f64 * channels as f64)
+        } else {
+            0.0
+        };
+        println!("   Captured {} samples ({:.1}s)", total_samples, actual_duration);
+
+        if total_samples == 0 {
+            return Err("No audio captured.".into());
+        }
+
+        // Write WAV file (16-bit PCM, mono conversion by averaging channels).
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let out_path = Self::recordings_dir().join(format!("voice_note_{}.wav", stamp));
+
+        // Convert f32 samples to 16-bit PCM, average channels to mono.
+        let num_frames = total_samples / channels as usize;
+        let mut pcm_data: Vec<i16> = Vec::with_capacity(num_frames);
+        for frame in 0..num_frames {
+            let start_idx = frame * channels as usize;
+            let mut sum = 0.0f32;
+            for ch in 0..channels as usize {
+                let idx = start_idx + ch;
+                if idx < total_samples {
+                    sum += all_samples[idx];
+                }
+            }
+            let avg = sum / channels as f32;
+            // Clamp and convert to i16
+            let sample = (avg * 32767.0).clamp(-32768.0, 32767.0) as i16;
+            pcm_data.push(sample);
+        }
+
+        let data_size = pcm_data.len() * 2; // 16-bit = 2 bytes per sample
+        let byte_rate = sample_rate * 2 * 1; // 16-bit mono
+        let block_align: u16 = 2;
+
+        use std::io::Write;
+        let mut wav = std::io::BufWriter::new(std::fs::File::create(&out_path)?);
+        // RIFF header
+        wav.write_all(b"RIFF")?;
+        wav.write_all(&(36u32 + data_size as u32).to_le_bytes())?;
+        wav.write_all(b"WAVE")?;
+        // fmt chunk
+        wav.write_all(b"fmt ")?;
+        wav.write_all(&16u32.to_le_bytes())?;  // chunk size
+        wav.write_all(&1u16.to_le_bytes())?;    // PCM format
+        wav.write_all(&1u16.to_le_bytes())?;    // mono
+        wav.write_all(&sample_rate.to_le_bytes())?;
+        wav.write_all(&byte_rate.to_le_bytes())?;
+        wav.write_all(&block_align.to_le_bytes())?;
+        wav.write_all(&16u16.to_le_bytes())?;   // bits per sample
+        // data chunk
+        wav.write_all(b"data")?;
+        wav.write_all(&data_size.to_le_bytes())?;
+        for &s in &pcm_data {
+            wav.write_all(&s.to_le_bytes())?;
+        }
+        wav.flush()?;
+
+        let file_size_kb = out_path.metadata().map(|m| m.len() / 1024).unwrap_or(0);
+        println!("   ✅ Saved: {} ({} KB, {:.1}s)", out_path.display(), file_size_kb, actual_duration);
+        Ok(out_path)
+    }
+
     /// Generate the contact URI for this user.
     fn contact_uri(&self) -> String {
         let key_hex = hex::encode(self.identity.public_key());
@@ -2243,6 +2391,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  /edit <idx> text    — Edit a sent message (see /status for index)");
     println!("  /search <text>       — Search message history");
     println!("  /sendfile <user> <path> [--hd] — Send a file (auto-compress images)");
+    println!("  /record [secs]         — Record microphone audio (saves as WAV)");
     println!("  /channel create <name>  — Create a broadcast channel");
     println!("  /channel sub <id>       — Subscribe to a channel");
     println!("  /channel unsub <id>     — Unsubscribe from a channel");
@@ -2319,6 +2468,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  /search <text>       — Search message history");
     println!("  /sendfile <user> <path> [--hd] — Send a file (auto-compress images)");
     println!("  /voice <user> <path>    — Send a voice message (audio file)");
+    println!("  /record [secs]         — Record from microphone (default 10s)");
             println!("  /channel create <name>  — Create a broadcast channel");
             println!("  /channel sub <id>       — Subscribe to a channel");
             println!("  /channel unsub <id>     — Unsubscribe from a channel");
@@ -3025,6 +3175,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             if let Err(e) = client.send_file(user, filepath, is_hd).await {
                 eprintln!("Error: {e}");
+            }
+            continue;
+        }
+
+        if let Some(rest) = input.strip_prefix("/record ") {
+            let secs: u64 = rest.trim().parse().unwrap_or(10);
+            match TinTinClient::record_voice(secs) {
+                Ok(_path) => println!("  Use /voice <user> <path> to send this recording."),
+                Err(e) => eprintln!("Recording failed: {e}"),
+            }
+            continue;
+        }
+        if input == "/record" {
+            match TinTinClient::record_voice(10) {
+                Ok(_path) => println!("  Use /voice <user> <path> to send this recording."),
+                Err(e) => eprintln!("Recording failed: {e}"),
             }
             continue;
         }
