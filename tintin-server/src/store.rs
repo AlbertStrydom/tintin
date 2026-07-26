@@ -24,7 +24,8 @@ impl Store {
             "CREATE TABLE IF NOT EXISTS users (
                 user_id         TEXT PRIMARY KEY,
                 identity_key    BLOB NOT NULL,
-                signed_pre_key  TEXT NOT NULL
+                signed_pre_key  TEXT NOT NULL,
+                presence        TEXT NOT NULL DEFAULT 'offline'
             );
 
             CREATE TABLE IF NOT EXISTS messages (
@@ -127,6 +128,7 @@ impl Store {
         // Migration: add columns for existing databases.
         let _ = conn.execute_batch("ALTER TABLE timeline_posts ADD COLUMN target_user_id TEXT;");
         let _ = conn.execute_batch("ALTER TABLE messages ADD COLUMN sender_id TEXT;");
+        let _ = conn.execute_batch("ALTER TABLE users ADD COLUMN presence TEXT NOT NULL DEFAULT 'offline';");
 
         Ok(Store {
             conn: Mutex::new(conn),
@@ -389,6 +391,16 @@ impl Store {
         Ok(ts)
     }
 
+    /// Set a user's presence (online/offline).
+    pub fn set_presence(&self, user_id: &str, presence: &str) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE users SET presence = ?1 WHERE user_id = ?2",
+            params![presence, user_id],
+        )?;
+        Ok(())
+    }
+
     /// Clear a user's status.
     pub fn clear_status(&self, user_id: &str) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
@@ -420,21 +432,25 @@ impl Store {
         Ok(rows)
     }
 
-    /// List registered user IDs, optionally filtered by a search query.
-    pub fn list_users(&self, query: Option<&str>) -> Result<Vec<String>, rusqlite::Error> {
+    /// List registered user IDs with presence, optionally filtered by a search query.
+    pub fn list_users(&self, query: Option<&str>) -> Result<Vec<(String, String)>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
 
         let users = if let Some(q) = query {
             let pattern = format!("%{}%", q);
             let mut stmt = conn.prepare(
-                "SELECT user_id FROM users WHERE user_id LIKE ?1 ORDER BY user_id",
+                "SELECT user_id, presence FROM users WHERE user_id LIKE ?1 ORDER BY user_id",
             )?;
-            stmt.query_map(params![pattern], |row| row.get(0))?
+            stmt.query_map(params![pattern], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
                 .filter_map(|r| r.ok())
                 .collect()
         } else {
-            let mut stmt = conn.prepare("SELECT user_id FROM users ORDER BY user_id")?;
-            stmt.query_map([], |row| row.get(0))?
+            let mut stmt = conn.prepare("SELECT user_id, presence FROM users ORDER BY user_id")?;
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
                 .filter_map(|r| r.ok())
                 .collect()
         };

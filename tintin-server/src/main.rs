@@ -193,6 +193,14 @@ struct ClearStatusCmd {
     user_id: String,
 }
 
+#[derive(serde::Deserialize)]
+#[allow(dead_code)]
+struct SetPresenceCmd {
+    cmd: String,
+    user_id: String,
+    presence: String,
+}
+
 // ── Channel commands ────────────────────────────────────────────
 
 #[derive(serde::Deserialize)]
@@ -296,6 +304,7 @@ async fn handle_command(line: &str, state: &AppState) -> ServerResponse {
         "my_groups" => handle_my_groups(&value, state).await,
         "group_members" => handle_group_members(&value, state).await,
         "set_status" => handle_set_status(&value, state).await,
+        "set_presence" => handle_set_presence(&value, state).await,
         "clear_status" => handle_clear_status(&value, state).await,
         "get_stories" => handle_get_stories(&value, state).await,
         "create_channel" => handle_create_channel(&value, state).await,
@@ -466,9 +475,15 @@ async fn handle_list_users(value: &serde_json::Value, state: &AppState) -> Serve
     match state.store.list_users(cmd.query.as_deref()) {
         Ok(users) => {
             eprintln!("  → {} user(s) listed", users.len());
+            let users_json: Vec<serde_json::Value> = users
+                .into_iter()
+                .map(|(uid, presence)| {
+                    serde_json::json!({"user_id": uid, "presence": presence})
+                })
+                .collect();
             ServerResponse {
                 status: "ok".to_string(),
-                data: Some(serde_json::json!({"users": users})),
+                data: Some(serde_json::json!({"users": users_json})),
                 error: None,
             }
         }
@@ -669,6 +684,34 @@ async fn handle_clear_status(value: &serde_json::Value, state: &AppState) -> Ser
     match state.store.clear_status(&cmd.user_id) {
         Ok(()) => {
             eprintln!("  🗑️ Status cleared for '{}'", cmd.user_id);
+            ServerResponse {
+                status: "ok".to_string(),
+                data: None,
+                error: None,
+            }
+        }
+        Err(e) => ServerResponse {
+            status: "error".to_string(),
+            data: None,
+            error: Some(format!("Database error: {e}")),
+        },
+    }
+}
+
+async fn handle_set_presence(value: &serde_json::Value, state: &AppState) -> ServerResponse {
+    let cmd: SetPresenceCmd = match serde_json::from_value(value.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            return ServerResponse {
+                status: "error".to_string(),
+                data: None,
+                error: Some(format!("Invalid payload: {e}")),
+            }
+        }
+    };
+    match state.store.set_presence(&cmd.user_id, &cmd.presence) {
+        Ok(()) => {
+            eprintln!("  {} is now '{}'", cmd.user_id, cmd.presence);
             ServerResponse {
                 status: "ok".to_string(),
                 data: None,
@@ -1389,7 +1432,8 @@ mod tests {
         let data = resp.data.unwrap();
         let users = data["users"].as_array().unwrap();
         assert_eq!(users.len(), 1);
-        assert_eq!(users[0].as_str().unwrap(), "alice");
+        assert_eq!(users[0]["user_id"].as_str().unwrap(), "alice");
+        assert_eq!(users[0]["presence"].as_str().unwrap(), "offline");
     }
 
     // ── Channel tests ────────────────────────────────────────────

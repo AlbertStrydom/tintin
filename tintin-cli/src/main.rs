@@ -788,20 +788,39 @@ impl TinTinClient {
     }
 
     /// List all registered users on the server.
-    async fn list_users(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    async fn list_users(&self) -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
         let request = serde_json::json!({ "cmd": "list_users" });
         self.send_json(&request).await?;
         let resp = self.recv_json().await?;
         if resp["status"] != "ok" {
             return Err(format!("Failed to list users: {}", resp["error"]).into());
         }
-        let users: Vec<String> = resp["data"]["users"]
+        let users: Vec<(String, String)> = resp["data"]["users"]
             .as_array()
             .unwrap_or(&vec![])
             .iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .filter_map(|v| {
+                let user_id = v["user_id"].as_str()?.to_string();
+                let presence = v["presence"].as_str().unwrap_or("offline").to_string();
+                Some((user_id, presence))
+            })
             .collect();
         Ok(users)
+    }
+
+    /// Set our online presence.
+    async fn set_my_presence(&self, presence: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let request = serde_json::json!({
+            "cmd": "set_presence",
+            "user_id": self.user_id,
+            "presence": presence,
+        });
+        self.send_json(&request).await?;
+        let resp = self.recv_json().await?;
+        if resp["status"] != "ok" {
+            return Err(format!("Failed to set presence: {}", resp["error"]).into());
+        }
+        Ok(())
     }
 
     // ── Group methods ──────────────────────────────────────────
@@ -2535,7 +2554,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("         Example: /msg bob Hello Bob!");
     println!("  /msg <yourname> ... — Saved Messages (message yourself)");
     println!("  /recv               — Check for new messages");
-    println!("  /users              — List registered users");
+    println!("  /users              — List registered users (with presence)");
+    println!("  /online              — Set your status as online");
+    println!("  /offline             — Set your status as offline");
     println!("  /mygroups           — List your groups");
     println!("  /group create name  — Create a new group");
     println!("  /group join id      — Join an existing group");
@@ -2605,13 +2626,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
+        if input == "/online" {
+            if let Err(e) = client.set_my_presence("online").await {
+                eprintln!("Error: {e}");
+            } else {
+                println!("🟢 You are now online");
+            }
+            continue;
+        }
+        if input == "/offline" || input == "/away" {
+            if let Err(e) = client.set_my_presence("offline").await {
+                eprintln!("Error: {e}");
+            } else {
+                println!("⚫ You are now offline");
+            }
+            continue;
+        }
+
         if input == "/help" {
             println!("Commands:");
             println!("  /msg username text  — Send an E2E encrypted message");
             println!("         Example: /msg bob Hello Bob!");
             println!("  /msg <yourname> ... — Saved Messages (message yourself)");
             println!("  /recv               — Poll for new messages");
-            println!("  /users              — List registered users");
+            println!("  /users              — List registered users (with presence)");
+    println!("  /online              — Set your status as online");
+    println!("  /offline             — Set your status as offline");
             println!("  /mygroups           — List your groups");
             println!("  /group create name  — Create a new group");
             println!("  /group join id      — Join a group");
@@ -2691,9 +2731,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("No registered users.");
                     } else {
                         println!("Registered users ({}):", users.len());
-                        for u in &users {
-                            let me = if u == &client.user_id { " (you)" } else { "" };
-                            println!("  - {}{}", u, me);
+                        for (uid, presence) in &users {
+                            let me = if uid == &client.user_id { " (you)" } else { "" };
+                            let icon = if presence == "online" { "🟢" } else { "⚫" };
+                            println!("  {} {}{}", icon, uid, me);
                         }
                     }
                 }
