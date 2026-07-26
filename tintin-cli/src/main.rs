@@ -1509,6 +1509,58 @@ impl TinTinClient {
         Ok(())
     }
 
+    // ── QR Contact Sharing ────────────────────────────────────
+
+    /// Generate the contact URI for this user.
+    fn contact_uri(&self) -> String {
+        let key_hex = hex::encode(self.identity.public_key());
+        format!("tintin://add-contact?user_id={}&key={}", self.user_id, key_hex)
+    }
+
+    /// Display this user's contact info as a QR code.
+    fn show_my_qr(&self) {
+        use qrcode::QrCode;
+        use qrcode::render::unicode;
+
+        let uri = self.contact_uri();
+        let code = match QrCode::new(uri.as_bytes()) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("Failed to generate QR code: {e}");
+                return;
+            }
+        };
+        let image = code.render::<unicode::Dense1x2>()
+            .dark_color(unicode::Dense1x2::Dark)
+            .light_color(unicode::Dense1x2::Light)
+            .build();
+        println!("─── Your TinTin Contact QR ───");
+        println!("{}", image);
+        println!("───────────────────────────────");
+        println!("User ID: {}", self.user_id);
+        println!("Identity Key: {}", hex::encode(self.identity.public_key()));
+        println!("Share this QR code so others can add you!");
+        println!("Use /scan <data> to scan someone's code.");
+    }
+
+    /// Parse a contact URI and return (user_id, identity_key_hex).
+    fn parse_contact_uri(uri: &str) -> Option<(String, String)> {
+        let uri = uri.strip_prefix("tintin://add-contact?")?;
+        let mut user_id = None;
+        let mut key = None;
+        for pair in uri.split('&') {
+            let mut parts = pair.splitn(2, '=');
+            let name = parts.next()?;
+            let value = parts.next()?;
+            match name {
+                "user_id" => user_id = Some(value.to_string()),
+                "key" => key = Some(value.to_string()),
+                _ => {}
+            }
+        }
+        Some((user_id?, key?))
+    }
+
     /// Display decrypted message content, detecting group-tagged payloads.
     fn display_decrypted(sender: &str, plaintext: &[u8]) {
         // Check for TinTin structured message (group chat, etc.)
@@ -1925,6 +1977,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  /poll close <id>                — Close a poll (creator only)");
     println!("  /polls                          — List active polls");
     println!("  /sticker <user> <pack> <id> — Send an emoji sticker");
+    println!("  /qr                       — Show your contact QR code");
+    println!("  /scan <uri>               — Scan a contact QR URI");
     println!("  /call <user>                — Start an encrypted call");
     println!("  /accept <call_id>           — Accept incoming call");
     println!("  /end                       — End/hang up current call");
@@ -1983,6 +2037,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  /poll close <id>                — Close a poll (creator only)");
             println!("  /polls                          — List active polls");
             println!("  /sticker <user> <pack> <id> — Send an emoji sticker");
+            println!("  /qr                       — Show your contact QR code");
+            println!("  /scan <uri>               — Scan a contact QR URI");
             println!("  /call <user>                — Start an encrypted call");
             println!("  /accept <call_id>           — Accept incoming call");
             println!("  /end                       — End/hang up current call");
@@ -2479,6 +2535,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if input == "/end" || input == "/hangup" {
             if let Err(e) = client.end_call("ended").await {
                 eprintln!("Error: {e}");
+            }
+            continue;
+        }
+
+        if input == "/qr" || input == "/myqr" {
+            client.show_my_qr();
+            continue;
+        }
+
+        if let Some(rest) = input.strip_prefix("/scan ") {
+            let data = rest.trim();
+            if let Some((uid, key)) = TinTinClient::parse_contact_uri(data) {
+                println!("✓ Scanned contact:");
+                println!("  User ID: {}", uid);
+                println!("  Identity Key: {}", key);
+                println!("  Use /msg {} to start chatting!", uid);
+            } else {
+                eprintln!("Invalid contact URI. Expected: tintin://add-contact?user_id=...&key=...");
             }
             continue;
         }
