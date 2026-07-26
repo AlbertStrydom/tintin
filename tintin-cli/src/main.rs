@@ -281,6 +281,15 @@ impl TinTinClient {
         }
     }
 
+    /// Save all persistent state (manual /save command).
+    fn save_all(&self) {
+        self.save_history();
+        self.save_groups();
+        self.save_channels();
+        self.save_chat_log();
+        println!("💾 All data saved.");
+    }
+
     /// Append a message to the chat log and persist.
     fn record_message(&mut self, peer: &str, text: &str, outgoing: bool, is_group: bool, group_name: Option<String>, is_channel: bool, channel_name: Option<String>) {
         let ts = std::time::SystemTime::now()
@@ -2102,6 +2111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  /clearstory          — Remove your story");
     println!("  /status             — Show sent message status (✓/✓✓)");
     println!("  /help               — Show this help");
+    println!("  /save               — Save all data to disk");
     println!("  /quit               — Exit");
     println!();
     println!("Status indicators:");
@@ -2122,7 +2132,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if input == "/quit" {
+            client.save_all();
             break;
+        }
+
+        if input == "/save" {
+            client.save_all();
+            continue;
         }
 
         if input == "/help" {
@@ -2169,6 +2185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  /clearstory          — Remove your story");
             println!("  /status             — Show sent message status (✓/✓✓)");
             println!("  /help               — Show this help");
+            println!("  /save               — Save all data to disk");
             println!("  /quit               — Exit");
             continue;
         }
