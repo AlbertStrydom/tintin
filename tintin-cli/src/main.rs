@@ -1602,7 +1602,89 @@ impl TinTinClient {
         Ok(())
     }
 
-    // ── QR Contact Sharing ────────────────────────────────────
+    // ── Custom Sticker Upload ──────────────────────────────────
+
+    /// Directory for custom stickers.
+    fn sticker_dir() -> PathBuf {
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_else(|_| ".".to_string());
+        let dir = PathBuf::from(home).join(".tintin").join("stickers");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    /// Add a custom sticker from an image file.
+    fn add_custom_sticker(file_path: &str, name: &str) -> Result<(), String> {
+        let data = std::fs::read(file_path).map_err(|e| format!("Cannot read '{}': {}", file_path, e))?;
+        let img = image::load_from_memory(&data)
+            .map_err(|_| format!("'{}' is not a supported image format", file_path))?;
+        // Resize to 256×256 max, preserving aspect ratio.
+        let (w, h) = (img.width(), img.height());
+        let max_dim = 256u32;
+        let img = if w > max_dim || h > max_dim {
+            let ratio = max_dim as f64 / w.max(h) as f64;
+            let nw = (w as f64 * ratio) as u32;
+            let nh = (h as f64 * ratio) as u32;
+            img.resize(nw, nh, image::imageops::FilterType::Lanczos3)
+        } else {
+            img
+        };
+        let out_name = format!("{}.jpg", name);
+        let out_path = Self::sticker_dir().join(&out_name);
+        img.write_to(
+            &mut std::io::BufWriter::new(std::fs::File::create(&out_path).map_err(|e| e.to_string())?),
+            image::ImageFormat::Jpeg,
+        )
+        .map_err(|e| format!("Failed to write sticker: {}", e))?;
+        println!("  ✅ Sticker '{}' added ({}×{})", name, img.width(), img.height());
+        Ok(())
+    }
+
+    /// List custom stickers.
+    fn list_custom_stickers() -> Vec<(String, String)> {
+        let dir = Self::sticker_dir();
+        let mut stickers = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    if ext == "jpg" || ext == "png" || ext == "gif" || ext == "webp" {
+                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                            let size = std::fs::metadata(&path).ok().map(|m| m.len()).unwrap_or(0);
+                            stickers.push((stem.to_string(), format!("{} KB", size / 1024)));
+                        }
+                    }
+                }
+            }
+        }
+        stickers.sort_by(|a, b| a.0.cmp(&b.0));
+        stickers
+    }
+
+    /// Send a custom image sticker.
+    async fn send_custom_sticker(
+        &mut self,
+        recipient: &str,
+        sticker_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let sticker_path = Self::sticker_dir().join(format!("{}.jpg", sticker_name));
+        if !sticker_path.exists() {
+            return Err(format!("Sticker '{}' not found. Use /sticker list to see available stickers.", sticker_name).into());
+        }
+        let sticker_data = std::fs::read(&sticker_path)?;
+        let data_b64 = crate::base64_encode(&sticker_data);
+        let payload = serde_json::json!({
+            "__tintin_type": "sticker",
+            "pack_id": "custom",
+            "sticker_name": sticker_name,
+            "image_data": data_b64,
+        });
+        let text = serde_json::to_string(&payload)?;
+        self.send_message(recipient, &text).await?;
+        println!("🖼️ Sent custom sticker '{}' to '{}'", sticker_name, recipient);
+        Ok(())
+    }
 
     /// Generate the contact URI for this user.
     fn contact_uri(&self) -> String {
@@ -1692,13 +1774,39 @@ impl TinTinClient {
                 }
                 "sticker" => {
                     let pack = payload["pack_id"].as_str().unwrap_or("?");
-                    let sid = payload["sticker_id"].as_i64().unwrap_or(0);
-                    let emoji = payload["emoji"].as_str().unwrap_or("🖼️");
-                    let alt = payload["alt"].as_str().unwrap_or("");
-                    if alt.is_empty() {
-                        println!("{} {}: {} [{}#{}]", emoji, sender, emoji, pack, sid);
+                    if pack == "custom" {
+                        // Custom image sticker
+                        let sticker_name = payload["sticker_name"].as_str().unwrap_or("sticker");
+                        let data_b64 = payload["image_data"].as_str().unwrap_or("");
+                        if !data_b64.is_empty() {
+                            if let Ok(img_data) = crate::base64_decode(data_b64) {
+                                let dl_dir = Self::sticker_dir();
+                                let stamp = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0);
+                                let out_name = format!("{}_{}.jpg", sticker_name, stamp);
+                                let out_path = dl_dir.join(&out_name);
+                                if std::fs::write(&out_path, &img_data).is_ok() {
+                                    println!("🖼️ {}: [Custom sticker: {}] → saved", sender, sticker_name);
+                                } else {
+                                    println!("🖼️ {}: [Custom sticker: {}]", sender, sticker_name);
+                                }
+                            } else {
+                                println!("🖼️ {}: [Custom sticker: {}]", sender, sticker_name);
+                            }
+                        } else {
+                            println!("🖼️ {}: [Custom sticker: {}]", sender, sticker_name);
+                        }
                     } else {
-                        println!("{} {}: {} ({})", emoji, sender, emoji, alt);
+                        let sid = payload["sticker_id"].as_i64().unwrap_or(0);
+                        let emoji = payload["emoji"].as_str().unwrap_or("🖼️");
+                        let alt = payload["alt"].as_str().unwrap_or("");
+                        if alt.is_empty() {
+                            println!("{} {}: {} [{}#{}]", emoji, sender, emoji, pack, sid);
+                        } else {
+                            println!("{} {}: {} ({})", emoji, sender, emoji, alt);
+                        }
                     }
                     return;
                 }
@@ -2146,7 +2254,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  /poll results <id>              — View poll results");
     println!("  /poll close <id>                — Close a poll (creator only)");
     println!("  /polls                          — List active polls");
-    println!("  /sticker <user> <pack> <id> — Send an emoji sticker");
+    println!("  /sticker <user> <pack> <id> — Send emoji sticker");
+    println!("  /sticker add <path> <name>  — Add custom image sticker");
+    println!("  /sticker list               — List custom stickers");
+    println!("  /sticker <user> custom <n>  — Send custom sticker");
     println!("  /moment <text>          — Post to your timeline");
     println!("  /timeline               — View your timeline");
     println!("  /comment <id> <text>    — Comment on a timeline post");
@@ -2219,7 +2330,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("  /poll results <id>              — View poll results");
             println!("  /poll close <id>                — Close a poll (creator only)");
             println!("  /polls                          — List active polls");
-            println!("  /sticker <user> <pack> <id> — Send an emoji sticker");
+    println!("  /sticker <user> <pack> <id> — Send emoji sticker");
+    println!("  /sticker add <path> <name>  — Add custom image sticker");
+    println!("  /sticker list               — List custom stickers");
+    println!("  /sticker <user> custom <n>  — Send custom sticker");
     println!("  /moment <text>          — Post to your timeline");
     println!("  /moment <user> <text>   — Post on someone's wall");
             println!("  /timeline               — View your timeline");
@@ -2671,26 +2785,71 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if let Some(rest) = input.strip_prefix("/sticker ") {
-            let parts: Vec<&str> = rest.splitn(3, ' ').collect();
-            if parts.len() < 3 {
+            let parts: Vec<&str> = rest.splitn(4, ' ').collect();
+            if parts.is_empty() {
                 eprintln!("Usage: /sticker <user> <pack_id> <sticker_id>");
-                eprintln!("Packs: wave, face, heart, mood");
-                eprintln!("  /sticker alice wave 1  -> 👋");
+                eprintln!("       /sticker add <path> <name>");
+                eprintln!("       /sticker list");
+                eprintln!("       /sticker <user> custom <name>");
                 continue;
             }
-            let sid: i64 = match parts[2].parse() {
-                Ok(v) => v,
-                Err(_) => { eprintln!("Invalid sticker id"); continue; }
-            };
-            if let Err(e) = client.send_sticker(parts[0], parts[1], sid).await {
-                eprintln!("Error: {e}");
+            // Subcommand: add
+            if parts[0] == "add" && parts.len() >= 3 {
+                let path = parts[1];
+                let name = parts[2];
+                if let Err(e) = TinTinClient::add_custom_sticker(path, name) {
+                    eprintln!("Error: {e}");
+                }
+                continue;
+            }
+            // Subcommand: list
+            if parts[0] == "list" {
+                let stickers = TinTinClient::list_custom_stickers();
+                if stickers.is_empty() {
+                    println!("No custom stickers. Use /sticker add <path> <name>");
+                } else {
+                    println!("Custom stickers:");
+                    for (name, size) in &stickers {
+                        println!("  {} ({})", name, size);
+                    }
+                }
+                continue;
+            }
+            // Send sticker: /sticker <user> <pack> <id_or_custom_name>
+            if parts.len() < 3 {
+                eprintln!("Usage: /sticker <user> <pack_id> <sticker_id>");
+                eprintln!("       /sticker <user> custom <name>");
+                continue;
+            }
+            let user = parts[0];
+            let pack = parts[1];
+            if pack == "custom" {
+                if parts.len() < 3 {
+                    eprintln!("Usage: /sticker <user> custom <name>");
+                    continue;
+                }
+                let name = parts[2];
+                if let Err(e) = client.send_custom_sticker(user, name).await {
+                    eprintln!("Error: {e}");
+                }
+            } else {
+                let sid: i64 = match parts[2].parse() {
+                    Ok(v) => v,
+                    Err(_) => { eprintln!("Invalid sticker id"); continue; }
+                };
+                if let Err(e) = client.send_sticker(user, pack, sid).await {
+                    eprintln!("Error: {e}");
+                }
             }
             continue;
         }
 
         if input.starts_with("/sticker") && input.len() <= 10 {
             println!("Usage: /sticker <user> <pack_id> <sticker_id>");
-            println!("Packs:");
+            println!("       /sticker add <path> <name>");
+            println!("       /sticker list");
+            println!("       /sticker <user> custom <name>");
+            println!("Emoji packs:");
             println!("  wave  — 👋 Wave, 👍 Thumbs up, ✌️ Peace, 🤙 Call me");
             println!("  face  — 😊 Smile, 😂 LOL, 😍 Love, 😢 Sad, 😡 Angry");
             println!("  heart — ❤️ Red, 🧡 Orange, 💛 Yellow, 💚 Green, 💜 Purple");
